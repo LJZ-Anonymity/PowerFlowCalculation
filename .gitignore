@@ -1,3 +1,7 @@
 /.vs
 /PowerFlo.d24d9288
 /x64
+/PowerFlowCalculation.sln
+PowerFlowCalculation.vcxproj
+PowerFlowCalculation.vcxproj.filters
+PowerFlowCalculation.vcxproj.user

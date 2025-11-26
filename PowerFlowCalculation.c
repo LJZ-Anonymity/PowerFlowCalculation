@@ -4,14 +4,6 @@
 #include <stdio.h>
 #include <math.h>
 
-/*
- *  - 使用直角坐标牛顿-拉夫逊法（e,f 变量）；
- *  - 从 Data/Input 目录中批量读取算例（caseX.txt）；
- *  - 形成节点导纳矩阵 G+jB；
- *  - 迭代求解各节点电压；
- *  - 将每个算例的结果按 printpf 风格输出到 Data/Output 下对应的 *_Result.txt 文件。
- */
-
  /*====================== 基本数据结构定义 ======================*/
 
 typedef enum
@@ -127,7 +119,6 @@ static inline double mat_get(const double* mat, int order, int row, int col)
 /// <param name="row">行索引</param>
 /// <param name="col">列索引</param>
 /// <param name="value">要设置的值</returns>
-/// <returns>void</returns>
 static inline void mat_set(double* mat, int order, int row, int col, double value)
 {
     mat[row * order + col] = value; /* 设置矩阵中指定位置的元素值 */
@@ -164,7 +155,7 @@ static int strip_comment_and_trim(char* line)
 }
 
 /// <summary>
-/// 从 txt 文件读取网络数据，格式参考 InputData/case5.txt
+/// 从 txt 文件读取网络数据，格式参考 Input/case5.txt
 /// </summary>
 /// <param name="filename">文件名</param>
 /// <param name="out_lines">输出线路参数</param>
@@ -441,7 +432,6 @@ static int read_case_txt(const char* filename,
 /// <param name="X">电抗</param>
 /// <param name="G">导纳实部</param>
 /// <param name="B">导纳虚部</param>
-/// <returns>void</returns>
 static void impedance_to_admittance(double R, double X, double* G, double* B)
 {
     double mod = R * R + X * X;
@@ -461,7 +451,6 @@ static void impedance_to_admittance(double R, double X, double* G, double* B)
 /// <param name="info">网络信息</param>
 /// <param name="lines">线路参数</param>
 /// <param name="count">线路参数数量</param>
-/// <returns>void</returns>
 static void copy_and_convert_lines(NetworkInfo* info, const LineArg* lines, size_t count)
 {
     size_t i;
@@ -509,7 +498,6 @@ static int discover_order(const NodeArg* nodes, size_t node_count)
 /// <param name="info">网络信息</param>
 /// <param name="nodes">节点参数</param>
 /// <param name="count">节点参数数量</param>
-/// <returns>void</returns>
 static void reorder_nodes(NetworkInfo* info, const NodeArg* nodes, size_t count)
 {
     int idx;
@@ -553,7 +541,6 @@ static void reorder_nodes(NetworkInfo* info, const NodeArg* nodes, size_t count)
 /// <param name="info">网络信息</param>
 /// <param name="init_vals">初始值</param>
 /// <param name="count">初始值数量</param>
-/// <returns>void</returns>
 static void reorder_init_values(NetworkInfo* info, const InitVal* init_vals, size_t count)
 {
     int idx;
@@ -592,7 +579,6 @@ static void reorder_init_values(NetworkInfo* info, const InitVal* init_vals, siz
 /// 分配状态变量
 /// </summary>
 /// <param name="info">网络信息</param>
-/// <returns>void</returns>
 static void allocate_state(NetworkInfo* info)
 {
     int i;
@@ -613,7 +599,6 @@ static void allocate_state(NetworkInfo* info)
 /// 分配导纳矩阵
 /// </summary>
 /// <param name="info">网络信息</param>
-/// <returns>void</returns>
 static void allocate_admittance(NetworkInfo* info)
 {
     if (!info) return;
@@ -628,7 +613,6 @@ static void allocate_admittance(NetworkInfo* info)
 /// 填充导纳矩阵
 /// </summary>
 /// <param name="info">网络信息</param>
-/// <returns>void</returns>
 static void fill_admittance(NetworkInfo* info)
 {
     int i, j;
@@ -684,7 +668,6 @@ static void fill_admittance(NetworkInfo* info)
 /// <param name="node_count">节点参数数量</param>
 /// <param name="init_vals">初始值</param>
 /// <param name="init_count">初始值数量</param>
-/// <returns>void</returns>
 static void init_network(NetworkInfo* info,
     const LineArg* lines,
     size_t line_count,
@@ -709,7 +692,6 @@ static void init_network(NetworkInfo* info,
 /// 释放网络
 /// </summary>
 /// <param name="info">网络信息</param>
-/// <returns>void</returns>
 static void free_network(NetworkInfo* info)
 {
     if (!info) return;
@@ -745,7 +727,6 @@ static int locate_slack(const NetworkInfo* info)
 /// 构建索引集合
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <returns>void</returns>
 static void build_index_sets(NLIteration* ctx)
 {
     int i;
@@ -821,7 +802,6 @@ static int init_iteration(NLIteration* ctx, NetworkInfo* info)
 /// 释放牛顿-拉夫逊迭代
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <returns>void</returns>
 static void free_iteration(NLIteration* ctx)
 {
     if (!ctx) return;
@@ -839,7 +819,6 @@ static void free_iteration(NLIteration* ctx)
 /// <param name="node_idx">节点索引</param>
 /// <param name="P_calc">计算有功功率</param>
 /// <param name="Q_calc">计算无功功率</param>
-/// <returns>void</returns>
 static void compute_power_balance(const NetworkInfo* info,
     int node_idx,
     double* P_calc,
@@ -871,7 +850,6 @@ static void compute_power_balance(const NetworkInfo* info,
 /// 计算增量
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <returns>void</returns>
 static void calc_delta(NLIteration* ctx)
 {
     int eq_pos = 0;
@@ -911,7 +889,6 @@ static void calc_delta(NLIteration* ctx)
 /// <param name="row_idx">行索引</param>
 /// <param name="row1">第一行</param>
 /// <param name="row2">第二行</param>
-/// <returns>void</returns>
 static void fill_row_pair(NLIteration* ctx, int row_idx, double* row1, double* row2)
 {
     int node_idx = ctx->var_indices[row_idx];
@@ -988,7 +965,6 @@ static void fill_row_pair(NLIteration* ctx, int row_idx, double* row1, double* r
 /// 生成雅可比矩阵
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <returns>void</returns>
 static void gen_jacobian(NLIteration* ctx)
 {
     int row;
@@ -1011,7 +987,6 @@ static void gen_jacobian(NLIteration* ctx)
 /// <param name="b">常数项向量</param>
 /// <param name="x">解向量</param>
 /// <param name="n">方程个数</param>
-/// <returns>void</returns>
 static void solve_linear_system(const double* A, const double* b, double* x, int n)
 {
     int i, j, col;

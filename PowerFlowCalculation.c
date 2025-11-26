@@ -3,7 +3,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-#include <time.h>
 
 /*
  *  - 使用直角坐标牛顿-拉夫逊法（e,f 变量）；
@@ -1113,10 +1112,11 @@ static int apply_correction(NLIteration* ctx, const double* correction)
 /// 开始迭代
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <param name="tolerance">容差</param>
-/// <param name="max_iter">最大迭代次数</param>
-/// <param name="converged_out">是否收敛</param>
-/// <param name="iter_out">迭代次数</param>
+/// <param name="tolerance">容差，用于判断迭代是否收敛</param>
+/// <param name="max_iter">最大迭代次数，防止无限迭代</param>
+/// <param name="converged_out">迭代是否收敛</param>
+/// <param name="iter_out">完成迭代的次数</param>
+/// <param name="runtime_out">迭代所用的运行时间（秒）</param>
 static void start_iteration(NLIteration* ctx,
     double tolerance,
     int max_iter,
@@ -1134,16 +1134,14 @@ static void start_iteration(NLIteration* ctx,
     ctx->tolerance = tolerance;
     ctx->max_iter = max_iter;
 
+    /* 为校正向量分配内存，大小为eq_count个double类型的空间 */
     correction = (double*)calloc((size_t)ctx->eq_count, sizeof(double));
     ensure_alloc(correction, "correction vector");
 
-#ifdef _WIN32
+    /* 高精度计时 */
     LARGE_INTEGER freq, t0, t1;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-#else
-    clock_t t0 = clock();
-#endif
 
     while (!converged && iteration < ctx->max_iter)
     {
@@ -1153,15 +1151,9 @@ static void start_iteration(NLIteration* ctx,
         converged = apply_correction(ctx, correction);
         iteration++;
     }
-#ifdef _WIN32
+
     QueryPerformanceCounter(&t1);
     runtime = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
-#else
-    {
-        clock_t t1 = clock();
-        runtime = (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
-    }
-#endif
 
     if (converged)
         printf("Converged : YES\n");
@@ -1180,20 +1172,17 @@ static void start_iteration(NLIteration* ctx,
     free(correction);
 }
 
-/*====================== 结果输出（仿 printpf 样例） ======================*/
+/*====================== 结果输出（仿样例） ======================*/
 
 /// <summary>
-/// 输出结果到流
+/// 输出潮流计算结果，输出到控制台
 /// </summary>
-/// <param name="fp">文件指针</param>
 /// <param name="info">网络信息</param>
 /// <param name="lines">线路参数</param>
 /// <param name="line_count">线路参数数量</param>
 /// <param name="converged">是否收敛</param>
 /// <param name="runtime">运行时间</param>
-/// <returns>void</returns>
-static void print_report_to_stream(FILE* fp,
-    const NetworkInfo* info,
+static void print_report(const NetworkInfo* info,
     const LineArg* lines,
     size_t line_count,
     int converged,
@@ -1204,7 +1193,7 @@ static void print_report_to_stream(FILE* fp,
     double totalPg = 0.0, totalQg = 0.0;
     double totalPl = 0.0, totalQl = 0.0;
 
-    if (!info || !fp) return;
+    if (!info) return;
 
     for (i = 0; i < info->order; ++i)
     {
@@ -1214,16 +1203,16 @@ static void print_report_to_stream(FILE* fp,
         totalQl += info->nodes[i].Ql;
     }
 
-    fprintf(fp, "%% ===============================================================================\n");
-    fprintf(fp, "%% |     System Summary                                                           |\n");
-    fprintf(fp, "%% ===============================================================================\n\n");
+    printf("%% ===============================================================================\n");
+    printf("%% |     System Summary                                                           |\n");
+    printf("%% ===============================================================================\n\n");
 
-    fprintf(fp, "%% Runtime   : %.3f ms\n", runtime * 1000.0);
-    fprintf(fp, "%% Converged : %s\n\n", converged ? "YES" : "NO");
+    printf("%% Runtime   : %.3f ms\n", runtime * 1000.0);
+    printf("%% Converged : %s\n\n", converged ? "YES" : "NO");
 
-    fprintf(fp, "%% How many?                How much?              P (MW)            Q (MVAr)\n");
-    fprintf(fp, "%% ---------------------    -------------------  -------------  -----------------\n");
-    fprintf(fp, "%% Buses              %2d     Total Gen Capacity       -                 -\n",
+    printf("%% How many?                How much?              P (MW)            Q (MVAr)\n");
+    printf("%% ---------------------    -------------------  -------------  -----------------\n");
+    printf("%% Buses              %2d     Total Gen Capacity       -                 -\n",
         info->order);
 
     /* 这里简单用“有发电”的节点个数当作机组数 */
@@ -1233,23 +1222,23 @@ static void print_report_to_stream(FILE* fp,
         if (info->nodes[i].Pg > 1e-6) genBus++;
         if (info->nodes[i].Pl > 1e-6) loadBus++;
     }
-    fprintf(fp, "%% Generators         %2d     Generation (actual)  %11.2f       %11.2f\n",
+    printf("%% Generators         %2d     Generation (actual)  %11.2f       %11.2f\n",
         genBus, totalPg * baseMVA, totalQg * baseMVA);
-    fprintf(fp, "%% Loads              %2d     Load                %11.2f       %11.2f\n",
+    printf("%% Loads              %2d     Load                %11.2f       %11.2f\n",
         loadBus, totalPl * baseMVA, totalQl * baseMVA);
 
     double pLoss = (totalPg - totalPl) * baseMVA;
     double qLoss = (totalQg - totalQl) * baseMVA;
-    fprintf(fp, "%% Shunts             0     Shunt (inj)              0.00              0.00\n");
-    fprintf(fp, "%% Branches        %4zu     Losses (I^2 * Z)      %11.2f       %11.2f\n\n",
+    printf("%% Shunts             0     Shunt (inj)              0.00              0.00\n");
+    printf("%% Branches        %4zu     Losses (I^2 * Z)      %11.2f       %11.2f\n\n",
         line_count, pLoss, qLoss);
 
-    fprintf(fp, "%% ===============================================================================\n");
-    fprintf(fp, "%% |     Bus Data                                                                 |\n");
-    fprintf(fp, "%% ===============================================================================\n");
-    fprintf(fp, "%%  Bus      Voltage          Generation             Load        \n");
-    fprintf(fp, "%%   #   Mag(pu) Ang(deg)   P (MW)   Q (MVAr)   P (MW)   Q (MVAr)\n");
-    fprintf(fp, "%% ----- ------- --------  --------  --------  --------  --------\n");
+    printf("%% ===============================================================================\n");
+    printf("%% |     Bus Data                                                                 |\n");
+    printf("%% ===============================================================================\n");
+    printf("%%  Bus      Voltage          Generation             Load        \n");
+    printf("%%   #   Mag(pu) Ang(deg)   P (MW)   Q (MVAr)   P (MW)   Q (MVAr)\n");
+    printf("%% ----- ------- --------  --------  --------  --------  --------\n");
 
     for (i = 0; i < info->order; ++i)
     {
@@ -1257,7 +1246,7 @@ static void print_report_to_stream(FILE* fp,
         double f = info->f[i];
         double mag = sqrt(e * e + f * f);
         double ang = atan2(f, e) * 180.0 / 3.14159265358979323846;
-        fprintf(fp, "%% %5d %7.3f %8.3f  %8.2f  %8.2f  %8.2f  %8.2f\n",
+        printf("%% %5d %7.3f %8.3f  %8.2f  %8.2f  %8.2f  %8.2f\n",
             i + 1,
             mag,
             ang,
@@ -1267,18 +1256,27 @@ static void print_report_to_stream(FILE* fp,
             info->nodes[i].Ql * baseMVA);
     }
 
-    fprintf(fp, "\n");
+    /* Bus 部分 Total 行 */
+    printf("%%                         --------  --------  --------  --------\n");
+    printf("%%                Total:  %8.2f  %8.2f  %8.2f  %8.2f\n",
+        totalPg * baseMVA,
+        totalQg * baseMVA,
+        totalPl * baseMVA,
+        totalQl * baseMVA);
 
-    fprintf(fp, "%% ===============================================================================\n");
-    fprintf(fp, "%% |     Branch Data                                                              |\n");
-    fprintf(fp, "%% ===============================================================================\n");
-    fprintf(fp, "%% Brnch   From   To    From Bus Injection   To Bus Injection     Loss (I^2 * Z)  \n");
-    fprintf(fp, "%%   #     Bus    Bus    P (MW)   Q (MVAr)   P (MW)   Q (MVAr)   P (MW)   Q (MVAr)\n");
-    fprintf(fp, "%% -----  -----  -----  --------  --------  --------  --------  --------  --------\n");
+    printf("\n");
+
+    printf("%% ===============================================================================\n");
+    printf("%% |     Branch Data                                                              |\n");
+    printf("%% ===============================================================================\n");
+    printf("%% Brnch   From   To    From Bus Injection   To Bus Injection     Loss (I^2 * Z)  \n");
+    printf("%%   #     Bus    Bus    P (MW)   Q (MVAr)   P (MW)   Q (MVAr)   P (MW)   Q (MVAr)\n");
+    printf("%% -----  -----  -----  --------  --------  --------  --------  --------  --------\n");
 
     if (lines && line_count > 0)
     {
         size_t k;
+        double sumPloss = 0.0, sumQloss = 0.0;
         for (k = 0; k < line_count; ++k)
         {
             int fb = lines[k].from_bus - 1;
@@ -1322,7 +1320,10 @@ static void print_report_to_stream(FILE* fp,
             double Ploss = (Sij_re + Sji_re) * baseMVA;
             double Qloss = (Sij_im + Sji_im) * baseMVA;
 
-            fprintf(fp, "%% %5zu  %5d  %5d  %8.2f  %8.2f  %8.2f  %8.2f  %8.3f  %8.3f\n",
+            sumPloss += Ploss;
+            sumQloss += Qloss;
+
+            printf("%% %5zu  %5d  %5d  %8.2f  %8.2f  %8.2f  %8.2f  %8.3f  %8.3f\n",
                 k + 1,
                 lines[k].from_bus,
                 lines[k].to_bus,
@@ -1333,21 +1334,23 @@ static void print_report_to_stream(FILE* fp,
                 Ploss,
                 Qloss);
         }
+
+        /* Branch 部分 Total 行 */
+        printf("%%                                                              --------  --------\n");
+        printf("%%                                                     Total:  %8.3f  %8.3f\n",
+            sumPloss,
+            sumQloss);
     }
 
-    fprintf(fp, "\n");
+    printf("\n");
 }
 
-/*====================== 单个算例求解与结果写入 ======================*/
-
-/// <summary>
-/// 求解算例到文件
-/// </summary>
-/// <param name="input_path">输入文件路径</param>
-/// <param name="output_path">输出文件路径</param>
-/// <returns>0: 成功, -1: 失败</returns>
-static int solve_case_to_file(const char* input_path, const char* output_path)
+/*====================== main：程序入口 ======================*/
+int main(void)
 {
+    SetConsoleOutputCP(65001); //输出用 UTF-8
+
+    const char* input_path = "Input/case5.txt";
     LineArg* line_args = NULL;
     NodeArg* node_args = NULL;
     InitVal* init_vals = NULL;
@@ -1358,18 +1361,12 @@ static int solve_case_to_file(const char* input_path, const char* output_path)
     int converged = 0;
     int iterations = 0;
     double runtime = 0.0;
-    FILE* fp_out = NULL;
-
-    printf("Processing case: %s\n", input_path);
 
     if (read_case_txt(input_path,
         &line_args, &line_count,
         &node_args, &node_count,
         &init_vals, &init_count) != 0)
-    {
-        fprintf(stderr, "Failed to read case file: %s\n", input_path);
         return 1;
-    }
 
     init_network(&info,
         line_args, line_count,
@@ -1387,21 +1384,8 @@ static int solve_case_to_file(const char* input_path, const char* output_path)
 
     start_iteration(&iter, 1e-4, 1000, &converged, &iterations, &runtime);
 
-    errno_t err = fopen_s(&fp_out, output_path, "w");
-    if (err != 0 || !fp_out)
-    {
-        fprintf(stderr, "Failed to open output file: %s\n", output_path);
-        free_iteration(&iter);
-        free_network(&info);
-        free(line_args);
-        free(node_args);
-        free(init_vals);
-        return 1;
-    }
-
-    print_report_to_stream(fp_out, &info, line_args, line_count, converged, runtime);
-
-    fclose(fp_out);
+    /* 按课程给的 printpf 样式输出结果（输出到控制台） */
+    print_report(&info, line_args, line_count, converged, runtime);
 
     free_iteration(&iter);
     free_network(&info);
@@ -1410,86 +1394,4 @@ static int solve_case_to_file(const char* input_path, const char* output_path)
     free(init_vals);
 
     return 0;
-}
-
-/*====================== 遍历目录处理所有算例 ======================*/
-
-/// <summary>
-/// 遍历指定输入目录下的所有 .txt 算例并输出结果到输出目录
-/// </summary>
-/// <param name="input_dir">输入目录（例如 "Data\\Input"）</param>
-/// <param name="output_dir">输出目录（例如 "Data\\Output"）</param>
-/// <returns>0: 成功, 1: 失败</returns>
-static int process_all_cases(const char* input_dir, const char* output_dir)
-{
-    WIN32_FIND_DATAA ffd;
-    HANDLE hFind = INVALID_HANDLE_VALUE;
-    char search_pattern[MAX_PATH];
-
-    /* 构造搜索模式，如 "Data\\Input\\*.txt" */
-    snprintf(search_pattern, sizeof(search_pattern), "%s\\*.txt", input_dir);
-
-    hFind = FindFirstFileA(search_pattern, &ffd);
-    if (hFind == INVALID_HANDLE_VALUE)
-    {
-        fprintf(stderr, "No txt files found in %s directory.\n", input_dir);
-        return 1;
-    }
-
-    /* 先处理 FindFirstFileA 返回的第一个文件，再循环处理后续文件 */
-    do
-    {
-        if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-        {
-            const char* fname = ffd.cFileName;
-            size_t len = strlen(fname);
-            if (len > 4 && _stricmp(fname + len - 4, ".txt") == 0)
-            {
-                char input_path[MAX_PATH];
-                char output_path[MAX_PATH];
-                char base_name[MAX_PATH];
-                size_t i;
-
-                /* 输入文件路径，例如 Data\\Input\\case30.txt */
-                snprintf(input_path, sizeof(input_path), "%s\\%s", input_dir, fname);
-
-                /* 去掉扩展名，生成 base_name，如 "case30" */
-                strncpy_s(base_name, sizeof(base_name), fname, _TRUNCATE);
-                for (i = 0; i < strlen(base_name); ++i)
-                {
-                    if (base_name[i] == '.')
-                    {
-                        base_name[i] = '\0';
-                        break;
-                    }
-                }
-
-                /* 输出文件路径，例如 Data\\Output\\case30_Result.txt */
-                snprintf(output_path, sizeof(output_path), "%s\\%s_Result.txt", output_dir, base_name);
-                solve_case_to_file(input_path, output_path);
-            }
-        }
-    } while (FindNextFileA(hFind, &ffd) != 0);
-
-    FindClose(hFind);
-    printf("All cases processed.\n");
-    return 0;
-}
-
-/*====================== main：程序入口 ======================*/
-
-/// <summary>
-/// 主函数
-/// </summary>
-/// <returns>0: 成功, 1: 失败</returns>
-int main(void)
-{
-    SetConsoleOutputCP(65001); //输出用 UTF-8
-
-    /* 确保输出目录存在（Data/Output/） */
-    CreateDirectoryA("Data", NULL);
-    CreateDirectoryA("Data\\Output", NULL);
-
-    /* 处理 Data/Input 中的所有算例 */
-    return process_all_cases("Data\\Input", "Data\\Output");
 }

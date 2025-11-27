@@ -1,3 +1,4 @@
+// #include <stdbool.h> 减少调用标准库，converged用int代替bool
 #include <windows.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +6,8 @@
 #include <math.h>
 
  /*====================== 基本数据结构定义 ======================*/
+
+const double PI = 3.14159265358979323846;
 
 typedef enum
 {
@@ -15,12 +18,12 @@ typedef enum
 
 typedef struct
 {
-    int from_bus;
-    int to_bus;
-    double series_R;
-    double series_X;
-    double shunt_G;
-    double shunt_B;
+    int from_bus; // 起始节点
+    int to_bus;   // 终止节点
+    double series_R; // 电阻
+    double series_X; // 电抗
+    double shunt_G; // 并联电导
+    double shunt_B; // 并联电纳
 } LineArg; // 线路参数
 
 typedef struct
@@ -39,21 +42,21 @@ typedef struct
 
 typedef struct
 {
-    int node_num;
-    double e;
-    double f;
+    int node_num; /* 节点编号 */
+    double e;     /* 节点电压幅值 */
+    double f;     /* 节点电压相角 */
 } InitVal; // 初始值
 
 typedef struct
 {
-    LineArg* lines;
-    size_t line_count;
+    LineArg* lines; /* 线路参数 */
+    size_t line_count; /* 线路参数数量 */
 
-    NodeArg* nodes;
-    size_t node_count;
+    NodeArg* nodes; /* 节点参数 */
+    size_t node_count; /* 节点参数数量 */
 
-    InitVal* init_values;
-    size_t init_count;
+    InitVal* init_values; /* 初始值 */
+    size_t init_count; /* 初始值数量 */
 
     int order;      /* 节点总数 */
 
@@ -66,11 +69,11 @@ typedef struct
 
 typedef struct
 {
-    NetworkInfo* info;
+    NetworkInfo* info; /* 网络信息 */
 
-    int slack_index;
-    int pq_count;
-    int pv_count;
+    int slack_index; /* 平衡节点索引 */
+    int pq_count;    /* PQ节点个数 */
+    int pv_count;    /* PV节点个数 */
     int non_slack;  /* 非平衡节点个数 */
 
     int eq_count;   /* 方程个数 = 2*non_slack（PQ: ΔP,ΔQ；PV: ΔP,Δ|U|） */
@@ -79,8 +82,8 @@ typedef struct
     double* delta;      /* 常数项向量 */
     double* J;          /* 雅可比矩阵 */
 
-    double tolerance;
-    int max_iter;
+    double tolerance; /* 收敛容差 */
+    int max_iter;    /* 最大迭代次数 */
 } NLIteration; // 牛顿-拉夫逊迭代
 
 /*====================== 工具函数 ======================*/
@@ -108,7 +111,7 @@ static void ensure_alloc(void* ptr, const char* label)
 /// <returns>矩阵中指定位置的元素值</returns>
 static inline double mat_get(const double* mat, int order, int row, int col)
 {
-    return mat[row * order + col]; /* 获取矩阵中指定位置的元素值 */
+    return mat[row * order + col];
 }
 
 /// <summary>
@@ -121,41 +124,33 @@ static inline double mat_get(const double* mat, int order, int row, int col)
 /// <param name="value">要设置的值</returns>
 static inline void mat_set(double* mat, int order, int row, int col, double value)
 {
-    mat[row * order + col] = value; /* 设置矩阵中指定位置的元素值 */
+    mat[row * order + col] = value;
 }
 
 /*====================== 文本输入读取（caseX.txt） ======================*/
 
 /// <summary>
-/// 去掉一行中的注释和首尾空白，返回是否还有有效内容
+/// 根据节点编号查找其在数组中的索引
 /// </summary>
-/// <param name="line">要处理的一行文本</param>
-/// <returns>1: 有效内容, 0: 无效内容</returns>
-static int strip_comment_and_trim(char* line)
+/// <param name="nodes">节点数组</param>
+/// <param name="count">节点数量</param>
+/// <param name="node_num">节点编号</param>
+/// <returns>对应索引，未找到返回 -1</returns>
+static int find_node_index_by_num(const NodeArg* nodes, size_t count, int node_num)
 {
-    char* p;
-    size_t len;
+    size_t idx;
 
-    if (!line) return 0; /* 没有有效内容 */
-    /* 删除 '%' 之后的注释 */
-    p = strchr(line, '%');
-    if (p) *p = '\0';
-
-    /* 去掉首尾空白 */
-    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n')
-        ++line;
-    len = strlen(line);
-    while (len > 0 &&
-        (line[len - 1] == ' ' || line[len - 1] == '\t' ||
-            line[len - 1] == '\r' || line[len - 1] == '\n'))
+    if (!nodes) return -1;
+    for (idx = 0; idx < count; ++idx)
     {
-        line[--len] = '\0';
+        if (nodes[idx].node_num == node_num)
+            return (int)idx;
     }
-    return (len > 0); /* 是否有有效内容 */
+    return -1;
 }
 
 /// <summary>
-/// 从 txt 文件读取网络数据，格式参考 Input/case5.txt
+/// 从 m 文件读取网络数据，格式参考 Input/case4.m
 /// </summary>
 /// <param name="filename">文件名</param>
 /// <param name="out_lines">输出线路参数</param>
@@ -164,261 +159,204 @@ static int strip_comment_and_trim(char* line)
 /// <param name="out_node_count">输出节点参数数量</param>
 /// <param name="out_inits">输出初始值</param>
 /// <returns>0: 成功, -1: 失败</returns>
-static int read_case_txt(const char* filename,
+static int read_case_m(const char* filename,
     LineArg** out_lines, size_t* out_line_count,
     NodeArg** out_nodes, size_t* out_node_count,
-    InitVal** out_inits, size_t* out_init_count)
+    InitVal** out_inits, size_t* out_init_count,
+    double* baseMVA)
 {
     FILE* fp;
     char buf[512];
     int nBus = 0, slackBus = 1;
     double Us = 1.0, eps = 1e-4;
-    int state = 0;
-    int i;
+    int i = 0;
 
-    LineArg* lines = NULL;
-    size_t line_count = 0;
-    NodeArg* nodes = NULL;
-    InitVal* inits = NULL;
+    if (!filename || !out_lines || !out_line_count || !out_nodes || !out_node_count || !out_inits || !out_init_count)
+        return -1;
 
-    if (!filename || !out_lines || !out_line_count ||
-        !out_nodes || !out_node_count || !out_inits || !out_init_count)
+    errno_t err = fopen_s(&fp, filename, "r");
+    if (err != 0 || !fp)
     {
-        return -1; /* 参数无效 */
+        fprintf(stderr, "Failed to open input file: %s\n", filename);
+        return -1;
     }
 
-    /* 在 VS 下使用 fopen_s 避免安全告警 */
-    {
-        errno_t err = fopen_s(&fp, filename, "r");
-        if (err != 0 || !fp)
-        {
-            fprintf(stderr, "Failed to open input file: %s\n", filename);
-            return -1;
-        }
-    }
-
+    // 读取 baseMVA
+    *baseMVA = 100.0;  // 默认值
     while (fgets(buf, sizeof(buf), fp))
     {
-        if (!strip_comment_and_trim(buf))
+        if (strstr(buf, "mpc.baseMVA") != NULL)
         {
-            continue; /* 空行或纯注释行 */
-        }
-
-        if (state == 0)
-        {
-            /* 读取头部：nBus slackBus Us eps */
-            if (sscanf_s(buf, "%d %d %lf %lf", &nBus, &slackBus, &Us, &eps) != 4)
+            if (sscanf_s(buf, "mpc.baseMVA = %lf", baseMVA) != 1)
             {
-                fprintf(stderr, "Header format error: %s\n", buf);
-                fclose(fp);
-                return -1;
+                *baseMVA = 100.0;
             }
-            state = 1;
-            continue;
+            break;
         }
+    }
 
-        if (state == 1)
+    // 读取 bus 数据
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        if (strstr(buf, "mpc.bus = [") != NULL)
         {
-            /* 读取线路条数 */
-            int nLine = 0;
-            if (sscanf_s(buf, "%d", &nLine) != 1 || nLine <= 0)
+            // 读取节点数据
+            int bus_count = 0;
+            while (fgets(buf, sizeof(buf), fp))
             {
-                fprintf(stderr, "Line count format error: %s\n", buf);
-                fclose(fp);
-                return -1;
+                if (strstr(buf, "];") != NULL)
+                    break;
+                int bus_i = 0;
+                int type = 0;
+                double Pd = 0.0;
+                double Qd = 0.0;
+                if (sscanf_s(buf, "%d %d %lf %lf", &bus_i, &type, &Pd, &Qd) == 4)
+                    bus_count++;
             }
-            lines = (LineArg*)calloc((size_t)nLine, sizeof(LineArg));
-            ensure_alloc(lines, "lines");
-            line_count = (size_t)nLine;
-            state = 2;
-            i = 0;
-            continue;
+            nBus = bus_count;
+            break;
         }
+    }
 
-        if (state == 2)
+    // 读取 branch 数据
+    size_t line_count = 0;
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        if (strstr(buf, "mpc.branch = [") != NULL)
         {
-            /* 读取每条线路：k i j r x b2 */
-            int k, fb, tb;
-            double r, x, b2;
-            if (i >= (int)line_count)
+            // 读取线路数据
+            while (fgets(buf, sizeof(buf), fp))
             {
-                /* 多余行，留给后面部分处理 */
-                state = 3;
+                if (strstr(buf, "];") != NULL)
+                    break;
+                int fbus = 0;
+                int tbus = 0;
+                double r = 0.0;
+                double x = 0.0;
+                if (sscanf_s(buf, "%d %d %lf %lf", &fbus, &tbus, &r, &x) == 4)
+                    line_count++;
             }
-            else
+            break;
+        }
+    }
+
+    // 分配内存
+    *out_lines = (LineArg*)calloc(line_count, sizeof(LineArg));
+    *out_nodes = (NodeArg*)calloc(nBus, sizeof(NodeArg));
+    *out_inits = (InitVal*)calloc(nBus, sizeof(InitVal));
+    ensure_alloc(*out_lines, "lines");
+    ensure_alloc(*out_nodes, "nodes");
+    ensure_alloc(*out_inits, "inits");
+
+    rewind(fp); // 重新读取文件，填充具体数据
+
+    // 读取节点数据
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        if (strstr(buf, "mpc.bus = [") != NULL)
+        {
+            int idx = 0;
+            while (fgets(buf, sizeof(buf), fp))
             {
-                if (sscanf_s(buf, "%d %d %d %lf %lf %lf", &k, &fb, &tb, &r, &x, &b2) != 6)
+                if (strstr(buf, "];") != NULL)
+                    break;
+                int bus_i = 0, type = 0;
+                double Pd = 0.0, Qd = 0.0;
+                double Gs = 0.0, Bs = 0.0, area = 0.0;
+                double Vm = 1.0, Va = 0.0;
+                double baseKV = 0.0, zone = 0.0, Vmax = 1.1, Vmin = 0.9;
+                int matched = sscanf_s(buf,
+                    "%d %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+                    &bus_i, &type, &Pd, &Qd, &Gs, &Bs, &area,
+                    &Vm, &Va, &baseKV, &zone, &Vmax, &Vmin);
+                if (matched >= 9)
                 {
-                    fprintf(stderr, "Line data format error: %s\n", buf);
-                    fclose(fp);
-                    free(lines);
-                    return -1;
-                }
-                lines[i].from_bus = fb;
-                lines[i].to_bus = tb;
-                lines[i].series_R = r;
-                lines[i].series_X = x;
-                lines[i].shunt_G = 0.0;
-                lines[i].shunt_B = b2; /* b/2 视为并联导纳虚部 */
-                ++i;
-                if (i < (int)line_count)
-                {
-                    continue;
-                }
-                /* 线路读完，进入下一状态：变压器数 */
-                state = 3;
-                continue;
-            }
-        }
+                    double theta_rad = Va * PI / 180.0;
+                    double e0 = Vm * cos(theta_rad);
+                    double f0 = Vm * sin(theta_rad);
 
-        if (state == 3)
-        {
-            /* 变压器行数，当前程序不使用，只读取并跳过后面的行 */
-            int nTrans = 0;
-            if (sscanf_s(buf, "%d", &nTrans) != 1)
-            {
-                fprintf(stderr, "Transformer count format error: %s\n", buf);
-                fclose(fp);
-                free(lines);
-                return -1;
-            }
-            /* 简单跳过 nTrans 行 */
-            while (nTrans-- > 0 && fgets(buf, sizeof(buf), fp))
-            {
-                /* do nothing */
-            }
-            state = 4;
-            continue;
-        }
-
-        if (state == 4)
-        {
-            /* 接地支路数量，同样只读取数量并跳过对应行 */
-            int nShunt = 0;
-            if (sscanf_s(buf, "%d", &nShunt) != 1)
-            {
-                fprintf(stderr, "Shunt count format error: %s\n", buf);
-                fclose(fp);
-                free(lines);
-                return -1;
-            }
-            while (nShunt-- > 0 && fgets(buf, sizeof(buf), fp))
-            {
-                /* do nothing */
-            }
-            state = 5;
-            continue;
-        }
-
-        if (state == 5)
-        {
-            /* 节点功率数据条数 */
-            int nNode = 0;
-            if (sscanf_s(buf, "%d", &nNode) != 1 || nNode <= 0)
-            {
-                fprintf(stderr, "Bus count format error: %s\n", buf);
-                fclose(fp);
-                free(lines);
-                return -1;
-            }
-            nodes = (NodeArg*)calloc((size_t)nNode, sizeof(NodeArg));
-            ensure_alloc(nodes, "nodes");
-            inits = (InitVal*)calloc((size_t)nNode, sizeof(InitVal));
-            ensure_alloc(inits, "inits");
-            *out_init_count = (size_t)nNode;
-            *out_node_count = (size_t)nNode;
-            for (i = 0; i < nNode; ++i)
-            {
-                /* 逐行读：k i PG QG PL QL */
-                int k_idx, bus_i;
-                double PG, QG, PL, QL;
-                if (!fgets(buf, sizeof(buf), fp) ||
-                    !strip_comment_and_trim(buf) ||
-                    sscanf_s(buf, "%d %d %lf %lf %lf %lf", &k_idx, &bus_i, &PG, &QG, &PL, &QL) != 6)
-                {
-                    fprintf(stderr, "Bus power data format error\n");
-                    fclose(fp);
-                    free(lines);
-                    free(nodes);
-                    free(inits);
-                    return -1;
-                }
-                nodes[i].node_num = bus_i;
-                /* 初始全部按 PQ 处理，后面再设置 slack 和 PV */
-                nodes[i].type = NODE_PQ;
-                nodes[i].Pg = PG;
-                nodes[i].Qg = QG;
-                nodes[i].Pl = PL;
-                nodes[i].Ql = QL;
-                nodes[i].P = PG - PL;
-                nodes[i].Q = QG - QL;
-                nodes[i].V = 0.0;
-                nodes[i].Theta = 0.0;
-
-                inits[i].node_num = bus_i;
-                inits[i].e = 1.0;
-                inits[i].f = 0.0;
-            }
-            state = 6;
-            continue;
-        }
-
-        if (state == 6)
-        {
-            /* PV 节点数据数量（可以为 0），这里只做类型和电压设定 */
-            int nPV = 0;
-            if (sscanf_s(buf, "%d", &nPV) != 1)
-            {
-                fprintf(stderr, "PV bus count format error: %s\n", buf);
-                fclose(fp);
-                free(lines);
-                free(nodes);
-                free(inits);
-                return -1;
-            }
-            for (i = 0; i < nPV; ++i)
-            {
-                int idx, bus_i;
-                double Vi, Qmin, Qmax;
-                if (!fgets(buf, sizeof(buf), fp) ||
-                    !strip_comment_and_trim(buf) ||
-                    sscanf_s(buf, "%d %d %lf %lf %lf", &idx, &bus_i, &Vi, &Qmin, &Qmax) != 5)
-                {
-                    fprintf(stderr, "PV bus data format error\n");
-                    fclose(fp);
-                    free(lines);
-                    free(nodes);
-                    free(inits);
-                    return -1;
-                }
-                if (bus_i >= 1 && bus_i <= nBus)
-                {
-                    int pos = bus_i - 1;
-                    nodes[pos].type = NODE_PV;
-                    nodes[pos].V = Vi;
+                    (*out_nodes)[idx].node_num = bus_i;
+                    (*out_nodes)[idx].type = (type == 3) ? NODE_SLACK :
+                        (type == 2) ? NODE_PV : NODE_PQ;
+                    (*out_nodes)[idx].Pl = Pd / *baseMVA;
+                    (*out_nodes)[idx].Ql = Qd / *baseMVA;
+                    (*out_nodes)[idx].P = -(*out_nodes)[idx].Pl;
+                    (*out_nodes)[idx].Q = -(*out_nodes)[idx].Ql;
+                    (*out_nodes)[idx].V = Vm;
+                    (*out_nodes)[idx].Theta = theta_rad;
+                    (*out_inits)[idx].node_num = bus_i;
+                    (*out_inits)[idx].e = e0;
+                    (*out_inits)[idx].f = f0;
+                    idx++;
                 }
             }
-            /* 所有信息已读完 */
+            break;
+        }
+    }
+
+    // 读取发电机数据，累加至对应节点
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        if (strstr(buf, "mpc.gen = [") != NULL)
+        {
+            while (fgets(buf, sizeof(buf), fp))
+            {
+                if (strstr(buf, "];") != NULL)
+                    break;
+                int gen_bus = 0;
+                double Pg = 0.0, Qg = 0.0;
+                if (sscanf_s(buf, "%d %lf %lf", &gen_bus, &Pg, &Qg) >= 3)
+                {
+                    int node_idx = find_node_index_by_num(*out_nodes, nBus, gen_bus);
+                    if (node_idx >= 0)
+                    {
+                        (*out_nodes)[node_idx].Pg += Pg / *baseMVA;
+                        (*out_nodes)[node_idx].Qg += Qg / *baseMVA;
+                        (*out_nodes)[node_idx].P = (*out_nodes)[node_idx].Pg - (*out_nodes)[node_idx].Pl;
+                        (*out_nodes)[node_idx].Q = (*out_nodes)[node_idx].Qg - (*out_nodes)[node_idx].Ql;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // 读取线路数据
+    while (fgets(buf, sizeof(buf), fp))
+    {
+        if (strstr(buf, "mpc.branch = [") != NULL)
+        {
+            int idx = 0;
+            while (fgets(buf, sizeof(buf), fp))
+            {
+                if (strstr(buf, "];") != NULL)
+                    break;
+                int fbus = 0, tbus = 0;
+                double r = 0.0, x = 0.0;
+                if (*out_lines && idx < line_count && line_count > 0)
+                {
+                    // 先尝试读取数据
+                    if (sscanf_s(buf, "%d %d %lf %lf", &fbus, &tbus, &r, &x) == 4)
+                    {
+                        // 只有成功读取数据后才写入
+                        (*out_lines)[idx].from_bus = fbus;
+                        (*out_lines)[idx].to_bus = tbus;
+                        (*out_lines)[idx].series_R = r;
+                        (*out_lines)[idx].series_X = x;
+                        (*out_lines)[idx].shunt_G = 0.0;
+                        (*out_lines)[idx].shunt_B = 0.0;
+                        idx++;
+                    }
+                }
+            }
             break;
         }
     }
 
     fclose(fp);
-
-    /* 设置平衡节点类型与初始电压 */
-    if (slackBus >= 1 && slackBus <= nBus)
-    {
-        int idx = slackBus - 1;
-        nodes[idx].type = NODE_SLACK;
-        nodes[idx].V = Us;
-        inits[idx].e = Us;
-        inits[idx].f = 0.0;
-    }
-
-    if (out_lines)      *out_lines = lines;
-    if (out_line_count) *out_line_count = line_count;
-    if (out_nodes)      *out_nodes = nodes;
-    if (out_inits)      *out_inits = inits;
+    *out_line_count = line_count;
+    *out_node_count = nBus;
+    *out_init_count = nBus;
 
     return 0;
 }
@@ -434,7 +372,7 @@ static int read_case_txt(const char* filename,
 /// <param name="B">导纳虚部</param>
 static void impedance_to_admittance(double R, double X, double* G, double* B)
 {
-    double mod = R * R + X * X;
+    double mod = R * R + X * X; /* 阻抗模平方，不开方减少额外运算，提高精度与效率 */
     if (mod == 0.0)
     {
         *G = 0.0;
@@ -1137,12 +1075,9 @@ static void start_iteration(NLIteration* ctx,
     printf("Iterations: %d\n", iteration);
     printf("Runtime   : %.3f ms\n\n", runtime * 1000.0);
 
-    if (converged_out)
-        *converged_out = converged;
-    if (iter_out)
-        *iter_out = iteration;
-    if (runtime_out)
-        *runtime_out = runtime;
+    if (converged_out) *converged_out = converged;
+    if (iter_out) *iter_out = iteration;
+    if (runtime_out) *runtime_out = runtime;
 
     free(correction);
 }
@@ -1180,11 +1115,7 @@ static void print_report(const NetworkInfo* info,
 
     printf("%% ===============================================================================\n");
     printf("%% |     System Summary                                                           |\n");
-    printf("%% ===============================================================================\n\n");
-
-    printf("%% Runtime   : %.3f ms\n", runtime * 1000.0);
-    printf("%% Converged : %s\n\n", converged ? "YES" : "NO");
-
+    printf("%% ===============================================================================\n");
     printf("%% How many?                How much?              P (MW)            Q (MVAr)\n");
     printf("%% ---------------------    -------------------  -------------  -----------------\n");
     printf("%% Buses              %2d     Total Gen Capacity       -                 -\n",
@@ -1217,10 +1148,10 @@ static void print_report(const NetworkInfo* info,
 
     for (i = 0; i < info->order; ++i)
     {
-        double e = info->e[i];
-        double f = info->f[i];
-        double mag = sqrt(e * e + f * f);
-        double ang = atan2(f, e) * 180.0 / 3.14159265358979323846;
+        double e = info->e[i]; /* 电压为虚部 */
+        double f = info->f[i]; /* 功率为实部 */
+        double mag = sqrt(e * e + f * f); /* 功率转电压 */
+        double ang = atan2(f, e) * 180.0 / PI; /* 弧度转角度 */
         printf("%% %5d %7.3f %8.3f  %8.2f  %8.2f  %8.2f  %8.2f\n",
             i + 1,
             mag,
@@ -1266,21 +1197,21 @@ static void print_report(const NetworkInfo* info,
             double dV_re = Vi_re - Vj_re;
             double dV_im = Vi_im - Vj_im;
 
-            /* series current from i to j: (G + jB)*(Vi - Vj) */
+            /* 从 i 节点到 j 节点的串联电流：(G + jB)*(Vi - Vj) */
             double Iser_ij_re = G * dV_re - B * dV_im;
             double Iser_ij_im = G * dV_im + B * dV_re;
-            /* shunt at from-bus: j*b2*Vi */
+            /* i 节点的并联支路电流：j*b2*Vi */
             double Ish_ij_re = -b2 * Vi_im;
             double Ish_ij_im = b2 * Vi_re;
 
             double Iij_re = Iser_ij_re + Ish_ij_re;
             double Iij_im = Iser_ij_im + Ish_ij_im;
 
-            /* S_ij = Vi * conj(I_ij) */
+            /* i 节点总电流 = 串联电流 + 并联电流 */
             double Sij_re = Vi_re * Iij_re + Vi_im * Iij_im;
             double Sij_im = Vi_im * Iij_re - Vi_re * Iij_im;
 
-            /* from j to i */
+            /* 从 j 节点到 i 节点的计算 */
             dV_re = Vj_re - Vi_re;
             dV_im = Vj_im - Vi_im;
             double Iser_ji_re = G * dV_re - B * dV_im;
@@ -1323,13 +1254,12 @@ static void print_report(const NetworkInfo* info,
 /*====================== main：程序入口 ======================*/
 int main(void)
 {
-    SetConsoleOutputCP(65001); //输出用 UTF-8
-
-    const char* input_path = "Input/case5.txt";
+    const char* input_path = "Input/case4.m";
     LineArg* line_args = NULL;
     NodeArg* node_args = NULL;
     InitVal* init_vals = NULL;
     size_t line_count = 0, node_count = 0, init_count = 0;
+    double baseMVA = 100.0;
 
     NetworkInfo info;
     NLIteration iter;
@@ -1337,16 +1267,10 @@ int main(void)
     int iterations = 0;
     double runtime = 0.0;
 
-    if (read_case_txt(input_path,
-        &line_args, &line_count,
-        &node_args, &node_count,
-        &init_vals, &init_count) != 0)
+    if (read_case_m(input_path, &line_args, &line_count, &node_args, &node_count, &init_vals, &init_count, &baseMVA) != 0)
         return 1;
 
-    init_network(&info,
-        line_args, line_count,
-        node_args, node_count,
-        init_vals, init_count);
+    init_network(&info, line_args, line_count, node_args, node_count, init_vals, init_count);
 
     if (init_iteration(&iter, &info) != 0)
     {

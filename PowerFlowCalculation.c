@@ -36,6 +36,8 @@ typedef struct
     double Qg;  /* 节点发电无功（标幺） */
     double Pl;  /* 节点负荷有功（标幺） */
     double Ql;  /* 节点负荷无功（标幺） */
+    double Gs;  /* 节点并联电导（标幺） */
+    double Bs;  /* 节点并联电纳（标幺） */
     double V;   /* 给定电压幅值（PV/平衡节点用） */
     double Theta;
 } NodeArg; // 节点参数
@@ -218,7 +220,7 @@ static int read_case_m(const char* filename,
         }
     }
 
-    // 读取 branch 数据
+    // 读取 branch 数据 (计数)
     size_t line_count = 0;
     while (fgets(buf, sizeof(buf), fp))
     {
@@ -233,7 +235,8 @@ static int read_case_m(const char* filename,
                 int tbus = 0;
                 double r = 0.0;
                 double x = 0.0;
-                if (sscanf_s(buf, "%d %d %lf %lf", &fbus, &tbus, &r, &x) == 4)
+                double b_half = 0.0; // 线路充电电纳 b/2
+                if (sscanf_s(buf, "%d %d %lf %lf %lf", &fbus, &tbus, &r, &x, &b_half) >= 5)
                     line_count++;
             }
             break;
@@ -280,8 +283,12 @@ static int read_case_m(const char* filename,
                         (type == 2) ? NODE_PV : NODE_PQ;
                     (*out_nodes)[idx].Pl = Pd / *baseMVA;
                     (*out_nodes)[idx].Ql = Qd / *baseMVA;
-                    (*out_nodes)[idx].P = -(*out_nodes)[idx].Pl;
-                    (*out_nodes)[idx].Q = -(*out_nodes)[idx].Ql;
+                    (*out_nodes)[idx].P = (*out_nodes)[idx].Pg - (*out_nodes)[idx].Pl;
+                    (*out_nodes)[idx].Q = (*out_nodes)[idx].Qg - (*out_nodes)[idx].Ql;
+
+                    (*out_nodes)[idx].Gs = Gs / *baseMVA;
+                    (*out_nodes)[idx].Bs = Bs / *baseMVA;
+
                     (*out_nodes)[idx].V = Vm;
                     (*out_nodes)[idx].Theta = theta_rad;
                     (*out_inits)[idx].node_num = bus_i;
@@ -305,7 +312,12 @@ static int read_case_m(const char* filename,
                     break;
                 int gen_bus = 0;
                 double Pg = 0.0, Qg = 0.0;
-                if (sscanf_s(buf, "%d %lf %lf", &gen_bus, &Pg, &Qg) >= 3)
+                double Qmax = 0.0, Qmin = 0.0, Vg = 0.0;
+                double mBase = 0.0;
+                int status = 0;
+                /* 读取更多字段以获取Vg（第6个字段） */
+                if (sscanf_s(buf, "%d %lf %lf %lf %lf %lf %lf %d",
+                    &gen_bus, &Pg, &Qg, &Qmax, &Qmin, &Vg, &mBase, &status) >= 3)
                 {
                     int node_idx = find_node_index_by_num(*out_nodes, nBus, gen_bus);
                     if (node_idx >= 0)
@@ -332,19 +344,19 @@ static int read_case_m(const char* filename,
                 if (strstr(buf, "];") != NULL)
                     break;
                 int fbus = 0, tbus = 0;
-                double r = 0.0, x = 0.0;
+                double r = 0.0, x = 0.0, b_half = 0.0; // 线路充电电纳 b/2
                 if (*out_lines && idx < line_count && line_count > 0)
                 {
-                    // 先尝试读取数据
-                    if (sscanf_s(buf, "%d %d %lf %lf", &fbus, &tbus, &r, &x) == 4)
+                    int matched = sscanf_s(buf, "%d %d %lf %lf %lf", &fbus, &tbus, &r, &x, &b_half);
+                    if (matched >= 5)
                     {
                         // 只有成功读取数据后才写入
                         (*out_lines)[idx].from_bus = fbus;
                         (*out_lines)[idx].to_bus = tbus;
                         (*out_lines)[idx].series_R = r;
                         (*out_lines)[idx].series_X = x;
-                        (*out_lines)[idx].shunt_G = 0.0;
-                        (*out_lines)[idx].shunt_B = 0.0;
+                        (*out_lines)[idx].shunt_G = 0.0; // 假设并联电导为 0
+                        (*out_lines)[idx].shunt_B = b_half; // 存储线路充电电纳 B/2
                         idx++;
                     }
                 }
@@ -380,7 +392,7 @@ static void impedance_to_admittance(double R, double X, double* G, double* B)
         return;
     }
     *G = R / mod;
-    *B = X / mod;
+    *B = -X / mod;
 }
 
 /// <summary>
@@ -554,11 +566,11 @@ static void allocate_admittance(NetworkInfo* info)
 static void fill_admittance(NetworkInfo* info)
 {
     int i, j;
-
     if (!info || !info->G || !info->B) return;
-    for (i = 0; i < info->order; ++i)
+
+    for (i = 0; i < info->order; ++i) // 行 (From Bus Index - 1)
     {
-        for (j = 0; j < info->order; ++j)
+        for (j = 0; j < info->order; ++j) // 列 (To Bus Index - 1)
         {
             double val_real = 0.0;
             double val_imag = 0.0;
@@ -568,30 +580,46 @@ static void fill_admittance(NetworkInfo* info)
                 for (k = 0; k < info->line_count; ++k)
                 {
                     const LineArg* line = &info->lines[k];
-                    if (line->from_bus == (j + 1) || line->to_bus == (j + 1))
+                    // 检查线路 k 是否连接到当前节点 i
+                    if (line->from_bus == (i + 1) || line->to_bus == (i + 1))
                     {
-                        val_real += line->series_R + line->shunt_G;
-                        val_imag += line->series_X + line->shunt_B;
+                        // 累加线路串联导纳的实部和虚部 (G + jB)
+                        val_real += line->series_R;
+                        val_imag += line->series_X;
+
+                        // 累加线路并联电纳 B/2
+                        val_imag += line->shunt_B;
                     }
                 }
+
+                // 累加节点自身的并联导纳 Gs + jBs
+                const NodeArg* node = &info->nodes[i];
+                val_real += node->Gs; // 节点并联电导 Gs (实部)
+                val_imag += node->Bs; // 节点并联电纳 Bs (虚部)
             }
             else
             {
                 size_t k;
+                // 寻找连接节点 i 和 j 的支路
                 for (k = 0; k < info->line_count; ++k)
                 {
                     const LineArg* line = &info->lines[k];
-                    if ((line->from_bus == (i + 1) && line->to_bus == (j + 1)) ||
-                        (line->to_bus == (i + 1) && line->from_bus == (j + 1)))
+                    int bus_i = i + 1;
+                    int bus_j = j + 1;
+
+                    // 检查是否是 i-j 支路
+                    if ((line->from_bus == bus_i && line->to_bus == bus_j) ||
+                        (line->from_bus == bus_j && line->to_bus == bus_i))
                     {
-                        val_real += -line->series_R;
-                        val_imag += -line->series_X;
+                        // 非对角元素 Yij = -Yseries
+                        val_real = -line->series_R;
+                        val_imag = -line->series_X;
+                        break; // 找到支路后退出循环
                     }
                 }
             }
             mat_set(info->G, info->order, i, j, val_real);
-            /* 注意这里 B 存的是 -Im(Y) */
-            mat_set(info->B, info->order, i, j, -val_imag);
+            mat_set(info->B, info->order, i, j, val_imag);
         }
     }
 }
@@ -620,7 +648,7 @@ static void init_network(NetworkInfo* info,
     copy_and_convert_lines(info, lines, line_count);
     info->order = discover_order(nodes, node_count);
     reorder_nodes(info, nodes, node_count);
-    reorder_init_values(info, init_vals, init_count);
+    reorder_init_values(info, init_vals, node_count); // 修正 count 参数为 node_count
     allocate_state(info);
     allocate_admittance(info);
     fill_admittance(info);
@@ -779,8 +807,58 @@ static void compute_power_balance(const NetworkInfo* info,
         double f_j = info->f[j];
         double Gij = mat_get(info->G, info->order, node_idx, j);
         double Bij = mat_get(info->B, info->order, node_idx, j);
-        *P_calc += e_i * (Gij * e_j - Bij * f_j) + f_i * (Gij * f_j + Bij * e_j);
-        *Q_calc += f_i * (Gij * e_j - Bij * f_j) - e_i * (Gij * f_j + Bij * e_j);
+        /* 优化计算顺序，减少舍入误差 */
+        double Gij_ej = Gij * e_j;
+        double Gij_fj = Gij * f_j;
+        double Bij_fj = Bij * f_j;
+        double Bij_ej = Bij * e_j;
+        *P_calc += (e_i * (Gij_ej - Bij_fj)) + (f_i * (Gij_fj + Bij_ej));
+        *Q_calc += (f_i * (Gij_ej - Bij_fj)) - (e_i * (Gij_fj + Bij_ej));
+    }
+}
+
+/// <summary>
+/// 批量计算所有节点的功率
+/// </summary>
+/// <param name="info">网络信息</param>
+/// <param name="P_calc">输出数组，计算的有功功率</param>
+/// <param name="Q_calc">输出数组，计算的无功功率</param>
+static void compute_all_power_balance(const NetworkInfo* info, double* P_calc, double* Q_calc)
+{
+    int i, j;
+
+    if (!info || !P_calc || !Q_calc) return;
+
+    /* 初始化 */
+    for (i = 0; i < info->order; ++i)
+    {
+        P_calc[i] = 0.0;
+        Q_calc[i] = 0.0;
+    }
+
+    /* 批量计算：类似 MATLAB 的 V .* conj(Ybus * V) */
+    for (i = 0; i < info->order; ++i)
+    {
+        double e_i = info->e[i];
+        double f_i = info->f[i];
+
+        for (j = 0; j < info->order; ++j)
+        {
+            double e_j = info->e[j];
+            double f_j = info->f[j];
+            double Gij = mat_get(info->G, info->order, i, j);
+            double Bij = mat_get(info->B, info->order, i, j);
+
+            /* 优化计算顺序，减少舍入误差 */
+            double Gij_ej = Gij * e_j;
+            double Gij_fj = Gij * f_j;
+            double Bij_fj = Bij * f_j;
+            double Bij_ej = Bij * e_j;
+            /* P = e_i * (Gij * e_j - Bij * f_j) + f_i * (Gij * f_j + Bij * e_j) */
+            P_calc[i] += (e_i * (Gij_ej - Bij_fj)) + (f_i * (Gij_fj + Bij_ej));
+            /* Q = f_i * (Gij * e_j - Bij * f_j) - e_i * (Gij * f_j + Bij * e_j) */
+            Q_calc[i] += (f_i * (Gij_ej - Bij_fj)) - (e_i * (Gij_fj + Bij_ej));
+        }
     }
 }
 
@@ -793,30 +871,65 @@ static void calc_delta(NLIteration* ctx)
     int eq_pos = 0;
     int i;
 
-    /* PQ 节点：ΔP, ΔQ */
-    for (i = 0; i < ctx->pq_count; ++i)
+    /* 批量计算所有节点的功率（避免重复计算） */
+    double* P_calc = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+    double* Q_calc = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+
+    if (P_calc && Q_calc)
     {
-        int node_idx = ctx->var_indices[i];
-        double P_calc = 0.0, Q_calc = 0.0;
-        compute_power_balance(ctx->info, node_idx, &P_calc, &Q_calc);
-        ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc;
-        ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].Q - Q_calc;
+        compute_all_power_balance(ctx->info, P_calc, Q_calc);
+
+        /* PQ 节点：ΔP, ΔQ */
+        for (i = 0; i < ctx->pq_count; ++i)
+        {
+            int node_idx = ctx->var_indices[i];
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc[node_idx];
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].Q - Q_calc[node_idx];
+        }
+
+        /* PV 节点：ΔP, Δ(|U|^2) */
+        for (i = 0; i < ctx->pv_count; ++i)
+        {
+            int node_idx = ctx->var_indices[ctx->pq_count + i];
+            double e_i = ctx->info->e[node_idx];
+            double f_i = ctx->info->f[node_idx];
+
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc[node_idx];
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].V * ctx->info->nodes[node_idx].V
+                - (e_i * e_i + f_i * f_i);
+        }
+
+        free(P_calc);
+        free(Q_calc);
     }
-
-    /* PV 节点：ΔP, Δ(|U|^2) */
-    for (i = 0; i < ctx->pv_count; ++i)
+    else
     {
-        int node_idx = ctx->var_indices[ctx->pq_count + i];
-        double P_calc = 0.0, Q_calc = 0.0;
-        double e_i, f_i;
+        /* 如果内存分配失败，回退到原始方法 */
+        /* PQ 节点：ΔP, ΔQ */
+        for (i = 0; i < ctx->pq_count; ++i)
+        {
+            int node_idx = ctx->var_indices[i];
+            double P_calc_single = 0.0, Q_calc_single = 0.0;
+            compute_power_balance(ctx->info, node_idx, &P_calc_single, &Q_calc_single);
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc_single;
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].Q - Q_calc_single;
+        }
 
-        compute_power_balance(ctx->info, node_idx, &P_calc, &Q_calc);
-        e_i = ctx->info->e[node_idx];
-        f_i = ctx->info->f[node_idx];
+        /* PV 节点：ΔP, Δ(|U|^2) */
+        for (i = 0; i < ctx->pv_count; ++i)
+        {
+            int node_idx = ctx->var_indices[ctx->pq_count + i];
+            double P_calc_single = 0.0, Q_calc_single = 0.0;
+            double e_i, f_i;
 
-        ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc;
-        ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].V * ctx->info->nodes[node_idx].V
-            - (e_i * e_i + f_i * f_i);
+            compute_power_balance(ctx->info, node_idx, &P_calc_single, &Q_calc_single);
+            e_i = ctx->info->e[node_idx];
+            f_i = ctx->info->f[node_idx];
+
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].P - P_calc_single;
+            ctx->delta[eq_pos++] = ctx->info->nodes[node_idx].V * ctx->info->nodes[node_idx].V
+                - (e_i * e_i + f_i * f_i);
+        }
     }
 }
 
@@ -824,78 +937,222 @@ static void calc_delta(NLIteration* ctx)
 /// 填充行对
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <param name="row_idx">行索引</param>
-/// <param name="row1">第一行</param>
-/// <param name="row2">第二行</param>
+/// <param name="row_idx">行索引（非平衡节点在 var_indices 中的索引）</param>
+/// <param name="row1">第一行（ΔP 行）</param>
+/// <param name="row2">第二行（ΔQ 或 Δ|U|^2 行）</param>
 static void fill_row_pair(NLIteration* ctx, int row_idx, double* row1, double* row2)
 {
-    int node_idx = ctx->var_indices[row_idx];
+    int i = ctx->var_indices[row_idx]; // 当前节点在网络中的索引
     const NetworkInfo* info = ctx->info;
-    double e_i = info->e[node_idx];
-    double f_i = info->f[node_idx];
-    double H_ii = 0.0, N_ii = 0.0;
-    int k;
-    double Gii, Bii, J_ii, L_ii;
+    double e_i = info->e[i];
+    double f_i = info->f[i];
     int col;
-
-    for (k = 0; k < info->order; ++k)
-    {
-        double e_k = info->e[k];
-        double f_k = info->f[k];
-        double Gik = mat_get(info->G, info->order, node_idx, k);
-        double Bik = mat_get(info->B, info->order, node_idx, k);
-        H_ii += Gik * f_k + Bik * e_k;
-        N_ii += Gik * e_k - Bik * f_k;
-    }
-
-    Gii = mat_get(info->G, info->order, node_idx, node_idx);
-    Bii = mat_get(info->B, info->order, node_idx, node_idx);
-    J_ii = N_ii - Bii * f_i - Gii * e_i;
-    L_ii = -H_ii + Gii * f_i - Bii * e_i;
-
-    H_ii += -Bii * e_i + Gii * f_i;
-    N_ii += Gii * e_i + Bii * f_i;
 
     for (col = 0; col < ctx->non_slack; ++col)
     {
-        int node_j = ctx->var_indices[col];
-        if (node_idx == node_j)
+        int j = ctx->var_indices[col]; // 变量 $e_j, f_j$ 对应的节点在网络中的索引
+        double Gij = mat_get(info->G, info->order, i, j);
+        double Bij = mat_get(info->B, info->order, i, j);
+        double dP_dfj, dP_dej, dQ_dfj, dQ_dej;
+
+        if (i == j)
         {
-            row1[col * 2] = H_ii;
-            row1[col * 2 + 1] = N_ii;
-            if (info->nodes[node_idx].type == NODE_PV)
+            /* 对角元素 i=j: H_ii, N_ii, J_ii/L_ii */
+            double A_i = 0.0, B_i = 0.0; // A_i = sum_k(Gik*fk + Bik*ek), B_i = sum_k(Gik*ek - Bik*fk)
+            int k;
+
+            /* 计算 A_i 和 B_i */
+            for (k = 0; k < info->order; ++k)
             {
-                row2[col * 2] = 2.0 * f_i;
-                row2[col * 2 + 1] = 2.0 * e_i;
+                double e_k = info->e[k];
+                double f_k = info->f[k];
+                double Gik = mat_get(info->G, info->order, i, k);
+                double Bik = mat_get(info->B, info->order, i, k);
+
+                // B_i 对应实部 Gik*ek - Bik*fk
+                B_i += Gik * e_k - Bik * f_k;
+                // A_i 对应虚部 Gik*fk + Bik*ek
+                A_i += Gik * f_k + Bik * e_k;
+            }
+
+            /* Gij 和 Bij 此时为 Gii 和 Bii */
+
+            /* H_ii = ∂P/∂f_i = A_i + f_i * Gii - e_i * Bii */
+            dP_dfj = A_i + f_i * Gij - e_i * Bij;
+
+            /* N_ii = ∂P/∂e_i = B_i + e_i * Gii + f_i * Bii */
+            dP_dej = B_i + e_i * Gij + f_i * Bij;
+
+            if (info->nodes[i].type == NODE_PV)
+            {
+                /* PV 节点：第二行是 Δ(|U|^2) = |U|^2 - V_set^2 */
+                /* ∂(|U|^2)/∂f_i */
+                dQ_dfj = 2.0 * f_i;
+                /* ∂(|U|^2)/∂e_i */
+                dQ_dej = 2.0 * e_i;
             }
             else
             {
-                row2[col * 2] = J_ii;
-                row2[col * 2 + 1] = L_ii;
+                /* PQ 节点：第二行是 ΔQ */
+                /* J_ii = ∂Q/∂f_i = B_i - f_i * Bii - e_i * Gii */
+                dQ_dfj = B_i - f_i * Bij - e_i * Gij;
+                /* L_ii = ∂Q/∂e_i = -A_i - e_i * Bii + f_i * Gii */
+                dQ_dej = -A_i - e_i * Bij + f_i * Gij;
             }
         }
         else
         {
-            double Gij = mat_get(info->G, info->order, node_idx, node_j);
-            double Bij = mat_get(info->B, info->order, node_idx, node_j);
-            double H_ij = -Bij * e_i + Gij * f_i;
-            double N_ij = Gij * e_i + Bij * f_i;
-            double J_ij = -N_ij;
-            double L_ij = H_ij;
+            /* 非对角元素 i!=j: H_ij, N_ij, J_ij/L_ij */
 
-            row1[col * 2] = H_ij;
-            row1[col * 2 + 1] = N_ij;
-            if (info->nodes[node_idx].type == NODE_PV)
+            /* H_ij = ∂P_i/∂f_j = -e_i * B_ij + f_i * G_ij */
+            dP_dfj = -e_i * Bij + f_i * Gij;
+
+            /* N_ij = ∂P_i/∂e_j = e_i * G_ij + f_i * B_ij */
+            dP_dej = e_i * Gij + f_i * Bij;
+
+            if (info->nodes[i].type == NODE_PV)
             {
-                row2[col * 2] = 0.0;
-                row2[col * 2 + 1] = 0.0;
+                /* PV 节点：第二行是 Δ(|U|^2)。|U|_i^2 不依赖于 f_j, e_j (j != i) */
+                dQ_dfj = 0.0;
+                dQ_dej = 0.0;
             }
             else
             {
-                row2[col * 2] = J_ij;
-                row2[col * 2 + 1] = L_ij;
+                /* PQ 节点：第二行是 ΔQ */
+                /* J_ij = ∂Q_i/∂f_j = -e_i * G_ij - f_i * B_ij */
+                dQ_dfj = -e_i * Gij - f_i * Bij;
+                /* L_ij = ∂Q_i/∂e_j = -e_i * B_ij + f_i * G_ij */
+                dQ_dej = -e_i * Bij + f_i * Gij;
             }
         }
+
+        row1[col * 2] = dP_dfj;  // 对 f_j 的导数 (H/J 块)
+        row1[col * 2 + 1] = dP_dej; // 对 e_j 的导数 (N/L 块)
+        row2[col * 2] = dQ_dfj;  // 对 f_j 的导数 (J/dQ_df 或 ∂|U|^2/∂f)
+        row2[col * 2 + 1] = dQ_dej; // 对 e_j 的导数 (L/dQ_de 或 ∂|U|^2/∂e)
+    }
+}
+
+/// <summary>
+/// 预先计算所有节点的A_i和B_i（用于雅可比矩阵对角元素）
+/// </summary>
+/// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
+/// <param name="A">输出数组，A[i] = sum_k(Gik*fk + Bik*ek)</param>
+/// <param name="B">输出数组，B[i] = sum_k(Gik*ek - Bik*fk)</param>
+static void precompute_AB(NLIteration* ctx, double* A, double* B)
+{
+    const NetworkInfo* info = ctx->info;
+    int i, k;
+
+    if (!A || !B) return;
+
+    for (i = 0; i < info->order; ++i)
+    {
+        A[i] = 0.0;
+        B[i] = 0.0;
+        double e_i = info->e[i];
+        double f_i = info->f[i];
+
+        for (k = 0; k < info->order; ++k)
+        {
+            double e_k = info->e[k];
+            double f_k = info->f[k];
+            double Gik = mat_get(info->G, info->order, i, k);
+            double Bik = mat_get(info->B, info->order, i, k);
+
+            // B_i 对应实部 Gik*ek - Bik*fk
+            B[i] += Gik * e_k - Bik * f_k;
+            // A_i 对应虚部 Gik*fk + Bik*ek
+            A[i] += Gik * f_k + Bik * e_k;
+        }
+    }
+}
+
+/// <summary>
+/// 填充行对
+/// </summary>
+/// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
+/// <param name="row_idx">行索引（非平衡节点在 var_indices 中的索引）</param>
+/// <param name="row1">第一行（ΔP 行）</param>
+/// <param name="row2">第二行（ΔQ 或 Δ|U|^2 行）</param>
+/// <param name="A">预计算的A数组</param>
+/// <param name="B">预计算的B数组</param>
+static void fill_row_pair_optimized(NLIteration* ctx, int row_idx, double* row1, double* row2,
+    const double* A, const double* B)
+{
+    int i = ctx->var_indices[row_idx]; // 当前节点在网络中的索引
+    const NetworkInfo* info = ctx->info;
+    double e_i = info->e[i];
+    double f_i = info->f[i];
+    int col;
+
+    for (col = 0; col < ctx->non_slack; ++col)
+    {
+        int j = ctx->var_indices[col]; // 变量 $e_j, f_j$ 对应的节点在网络中的索引
+        double Gij = mat_get(info->G, info->order, i, j);
+        double Bij = mat_get(info->B, info->order, i, j);
+        double dP_dfj, dP_dej, dQ_dfj, dQ_dej;
+
+        if (i == j)
+        {
+            /* 对角元素 i=j: H_ii, N_ii, J_ii/L_ii */
+            /* 使用预计算的 A_i 和 B_i */
+            double A_i = A[i];
+            double B_i = B[i];
+
+            /* H_ii = ∂P/∂f_i = A_i + f_i * Gii - e_i * Bii */
+            dP_dfj = A_i + f_i * Gij - e_i * Bij;
+
+            /* N_ii = ∂P/∂e_i = B_i + e_i * Gii + f_i * Bii */
+            dP_dej = B_i + e_i * Gij + f_i * Bij;
+
+            if (info->nodes[i].type == NODE_PV)
+            {
+                /* PV 节点：第二行是 Δ(|U|^2) = |U|^2 - V_set^2 */
+                /* ∂(|U|^2)/∂f_i */
+                dQ_dfj = 2.0 * f_i;
+                /* ∂(|U|^2)/∂e_i */
+                dQ_dej = 2.0 * e_i;
+            }
+            else
+            {
+                /* PQ 节点：第二行是 ΔQ */
+                /* J_ii = ∂Q/∂f_i = B_i - f_i * Bii - e_i * Gii */
+                dQ_dfj = B_i - f_i * Bij - e_i * Gij;
+                /* L_ii = ∂Q/∂e_i = -A_i - e_i * Bii + f_i * Gii */
+                dQ_dej = -A_i - e_i * Bij + f_i * Gij;
+            }
+        }
+        else
+        {
+            /* 非对角元素 i!=j: H_ij, N_ij, J_ij/L_ij */
+
+            /* H_ij = ∂P_i/∂f_j = -e_i * B_ij + f_i * G_ij */
+            dP_dfj = -e_i * Bij + f_i * Gij;
+
+            /* N_ij = ∂P_i/∂e_j = e_i * G_ij + f_i * B_ij */
+            dP_dej = e_i * Gij + f_i * Bij;
+
+            if (info->nodes[i].type == NODE_PV)
+            {
+                /* PV 节点：第二行是 Δ(|U|^2)。|U|_i^2 不依赖于 f_j, e_j (j != i) */
+                dQ_dfj = 0.0;
+                dQ_dej = 0.0;
+            }
+            else
+            {
+                /* PQ 节点：第二行是 ΔQ */
+                /* J_ij = ∂Q_i/∂f_j = -e_i * G_ij - f_i * B_ij */
+                dQ_dfj = -e_i * Gij - f_i * Bij;
+                /* L_ij = ∂Q_i/∂e_j = -e_i * B_ij + f_i * G_ij */
+                dQ_dej = -e_i * Bij + f_i * Gij;
+            }
+        }
+
+        row1[col * 2] = dP_dfj;  // 对 f_j 的导数 (H/J 块)
+        row1[col * 2 + 1] = dP_dej; // 对 e_j 的导数 (N/L 块)
+        row2[col * 2] = dQ_dfj;  // 对 f_j 的导数 (J/dQ_df 或 ∂|U|^2/∂f)
+        row2[col * 2 + 1] = dQ_dej; // 对 e_j 的导数 (L/dQ_de 或 ∂|U|^2/∂e)
     }
 }
 
@@ -910,11 +1167,31 @@ static void gen_jacobian(NLIteration* ctx)
     if (!ctx || !ctx->J) return;
     memset(ctx->J, 0, (size_t)ctx->eq_count * (size_t)ctx->eq_count
         * sizeof(double));
-    for (row = 0; row < ctx->non_slack; ++row)
+
+    /* 预先计算所有节点的A_i和B_i，避免重复计算 */
+    double* A = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+    double* B = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+    if (A && B)
     {
-        double* row1 = ctx->J + (size_t)(2 * row) * (size_t)ctx->eq_count;
-        double* row2 = ctx->J + (size_t)(2 * row + 1) * (size_t)ctx->eq_count;
-        fill_row_pair(ctx, row, row1, row2);
+        precompute_AB(ctx, A, B);
+        for (row = 0; row < ctx->non_slack; ++row)
+        {
+            double* row1 = ctx->J + (size_t)(2 * row) * (size_t)ctx->eq_count;
+            double* row2 = ctx->J + (size_t)(2 * row + 1) * (size_t)ctx->eq_count;
+            fill_row_pair_optimized(ctx, row, row1, row2, A, B);
+        }
+        free(A);
+        free(B);
+    }
+    else
+    {
+        /* 如果内存分配失败，回退到原始方法 */
+        for (row = 0; row < ctx->non_slack; ++row)
+        {
+            double* row1 = ctx->J + (size_t)(2 * row) * (size_t)ctx->eq_count;
+            double* row2 = ctx->J + (size_t)(2 * row + 1) * (size_t)ctx->eq_count;
+            fill_row_pair(ctx, row, row1, row2);
+        }
     }
 }
 
@@ -997,20 +1274,12 @@ static void solve_linear_system(const double* A, const double* b, double* x, int
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
 /// <param name="correction">校正向量</param>
-/// <returns>0: 成功, -1: 失败</returns>
+/// <returns>0: 应用成功, 1: 无需应用（已收敛）</returns>
 static int apply_correction(NLIteration* ctx, const double* correction)
 {
     int i;
-    double max_abs = 0.0;
 
     if (!ctx || !correction) return 1;
-    for (i = 0; i < ctx->eq_count; ++i)
-    {
-        double val = fabs(correction[i]);
-        if (val > max_abs)
-            max_abs = val;
-    }
-    if (max_abs <= ctx->tolerance) return 1;
 
     for (i = 0; i < ctx->non_slack; ++i)
     {
@@ -1056,12 +1325,53 @@ static void start_iteration(NLIteration* ctx,
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
 
+    /* 初始检查：计算初始功率不匹配 */
+    calc_delta(ctx);
+    {
+        int i;
+        double max_mismatch = 0.0;
+        for (i = 0; i < ctx->eq_count; ++i)
+        {
+            double val = fabs(ctx->delta[i]);
+            if (val > max_mismatch)
+                max_mismatch = val;
+        }
+        if (max_mismatch < tolerance)
+        {
+            converged = 1;
+            if (converged_out) *converged_out = converged;
+            if (iter_out) *iter_out = iteration;
+            QueryPerformanceCounter(&t1);
+            runtime = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+            if (runtime_out) *runtime_out = runtime;
+            free(correction);
+            return;
+        }
+    }
+
     while (!converged && iteration < ctx->max_iter)
     {
-        calc_delta(ctx);
+        int i;
         gen_jacobian(ctx);
         solve_linear_system(ctx->J, ctx->delta, correction, ctx->eq_count);
-        converged = apply_correction(ctx, correction);
+        apply_correction(ctx, correction);
+        
+        /* 计算更新后的功率不匹配 */
+        calc_delta(ctx);
+        
+        /* 检查收敛：使用功率不匹配的无穷范数（与MATLAB版本一致） */
+        {
+            double max_mismatch = 0.0;
+            for (i = 0; i < ctx->eq_count; ++i)
+            {
+                double val = fabs(ctx->delta[i]);
+                if (val > max_mismatch)
+                    max_mismatch = val;
+            }
+            if (max_mismatch < tolerance)
+                converged = 1;
+        }
+        
         iteration++;
     }
 
@@ -1085,25 +1395,56 @@ static void start_iteration(NLIteration* ctx,
 /*====================== 结果输出（仿样例） ======================*/
 
 /// <summary>
+/// 更新平衡节点和PV节点的发电量（根据功率平衡方程计算）
+/// </summary>
+/// <param name="info">网络信息</param>
+static void update_generation(NetworkInfo* info)
+{
+    int i;
+    double P_calc, Q_calc;
+
+    if (!info) return;
+
+    /* 对于平衡节点和PV节点，逐个计算功率并更新发电量 */
+    for (i = 0; i < info->order; ++i)
+    {
+        if (info->nodes[i].type == NODE_SLACK || info->nodes[i].type == NODE_PV)
+        {
+            /* 计算节点的注入功率 */
+            compute_power_balance(info, i, &P_calc, &Q_calc);
+
+            /* 发电量 = 计算出的注入功率 + 负荷 */
+            /* P_injection = P_gen - P_load, 所以 P_gen = P_injection + P_load */
+            info->nodes[i].Pg = P_calc + info->nodes[i].Pl;
+            info->nodes[i].Qg = Q_calc + info->nodes[i].Ql;
+
+            /* 更新净注入功率 */
+            info->nodes[i].P = info->nodes[i].Pg - info->nodes[i].Pl;
+            info->nodes[i].Q = info->nodes[i].Qg - info->nodes[i].Ql;
+        }
+    }
+}
+
+/// <summary>
 /// 输出潮流计算结果，输出到控制台
 /// </summary>
 /// <param name="info">网络信息</param>
-/// <param name="lines">线路参数</param>
-/// <param name="line_count">线路参数数量</param>
 /// <param name="converged">是否收敛</param>
 /// <param name="runtime">运行时间</param>
 static void print_report(const NetworkInfo* info,
-    const LineArg* lines,
-    size_t line_count,
     int converged,
-    double runtime)
+    double runtime,
+    double baseMVA)
 {
-    const double baseMVA = 100.0; /* 可根据需要修改或从文件读取 */
     int i;
     double totalPg = 0.0, totalQg = 0.0;
     double totalPl = 0.0, totalQl = 0.0;
+    double sumPloss = 0.0, sumQloss = 0.0; // 用于存储累加的支路串联损耗
 
     if (!info) return;
+
+    /* 在输出前，更新平衡节点和PV节点的发电量（根据功率平衡计算） */
+    update_generation((NetworkInfo*)info);
 
     for (i = 0; i < info->order; ++i)
     {
@@ -1121,7 +1462,6 @@ static void print_report(const NetworkInfo* info,
     printf("%% Buses              %2d     Total Gen Capacity       -                 -\n",
         info->order);
 
-    /* 这里简单用“有发电”的节点个数当作机组数 */
     int genBus = 0, loadBus = 0;
     for (i = 0; i < info->order; ++i)
     {
@@ -1133,11 +1473,52 @@ static void print_report(const NetworkInfo* info,
     printf("%% Loads              %2d     Load                %11.2f       %11.2f\n",
         loadBus, totalPl * baseMVA, totalQl * baseMVA);
 
-    double pLoss = (totalPg - totalPl) * baseMVA;
-    double qLoss = (totalQg - totalQl) * baseMVA;
     printf("%% Shunts             0     Shunt (inj)              0.00              0.00\n");
+
+    /* 计算并累加总损耗 (仅使用串联部分损耗) */
+    if (info->lines && info->line_count > 0)
+    {
+        size_t k;
+        for (k = 0; k < info->line_count; ++k)
+        {
+            int fb = info->lines[k].from_bus - 1;
+            int tb = info->lines[k].to_bus - 1;
+            double G = info->lines[k].series_R;
+            double B_series = info->lines[k].series_X;
+
+            double Vi_re = info->e[fb], Vi_im = info->f[fb];
+            double Vj_re = info->e[tb], Vj_im = info->f[tb];
+
+            /* 从 i 到 j 的串联电流 */
+            double dV_re_ij = Vi_re - Vj_re;
+            double dV_im_ij = Vi_im - Vj_im;
+            double Iser_ij_re = G * dV_re_ij - B_series * dV_im_ij;
+            double Iser_ij_im = G * dV_im_ij + B_series * dV_re_ij;
+
+            /* 从 j 到 i 的串联电流 */
+            double dV_re_ji = Vj_re - Vi_re;
+            double dV_im_ji = Vj_im - Vi_im;
+            double Iser_ji_re = G * dV_re_ji - B_series * dV_im_ji;
+            double Iser_ji_im = G * dV_im_ji + B_series * dV_re_ji;
+
+            /* 从 i 到 j 的串联功率 Sser_ij = Vi * conj(Iser_ij) */
+            /* 使用更稳定的计算顺序 */
+            double Pser_ij = (Vi_re * Iser_ij_re) + (Vi_im * Iser_ij_im);
+            double Qser_ij = (Vi_im * Iser_ij_re) - (Vi_re * Iser_ij_im);
+
+            /* 从 j 到 i 的串联功率 Sser_ji = Vj * conj(Iser_ji) */
+            double Pser_ji = (Vj_re * Iser_ji_re) + (Vj_im * Iser_ji_im);
+            double Qser_ji = (Vj_im * Iser_ji_re) - (Vj_re * Iser_ji_im);
+
+            // 损耗 (I^2 * Z) = Sser_ij + Sser_ji
+            sumPloss += (Pser_ij + Pser_ji) * baseMVA;
+            sumQloss += (Qser_ij + Qser_ji) * baseMVA;
+        }
+    }
+
     printf("%% Branches        %4zu     Losses (I^2 * Z)      %11.2f       %11.2f\n\n",
-        line_count, pLoss, qLoss);
+        info->line_count, sumPloss, sumQloss);
+
 
     printf("%% ===============================================================================\n");
     printf("%% |     Bus Data                                                                 |\n");
@@ -1148,10 +1529,10 @@ static void print_report(const NetworkInfo* info,
 
     for (i = 0; i < info->order; ++i)
     {
-        double e = info->e[i]; /* 电压为虚部 */
-        double f = info->f[i]; /* 功率为实部 */
-        double mag = sqrt(e * e + f * f); /* 功率转电压 */
-        double ang = atan2(f, e) * 180.0 / PI; /* 弧度转角度 */
+        double e = info->e[i];
+        double f = info->f[i];
+        double mag = sqrt(e * e + f * f);
+        double ang = atan2(f, e) * 180.0 / PI;
         printf("%% %5d %7.3f %8.3f  %8.2f  %8.2f  %8.2f  %8.2f\n",
             i + 1,
             mag,
@@ -1162,7 +1543,6 @@ static void print_report(const NetworkInfo* info,
             info->nodes[i].Ql * baseMVA);
     }
 
-    /* Bus 部分 Total 行 */
     printf("%%                         --------  --------  --------  --------\n");
     printf("%%                Total:  %8.2f  %8.2f  %8.2f  %8.2f\n",
         totalPg * baseMVA,
@@ -1179,69 +1559,99 @@ static void print_report(const NetworkInfo* info,
     printf("%%   #     Bus    Bus    P (MW)   Q (MVAr)   P (MW)   Q (MVAr)   P (MW)   Q (MVAr)\n");
     printf("%% -----  -----  -----  --------  --------  --------  --------  --------  --------\n");
 
-    if (lines && line_count > 0)
+    /* 计算并打印 Branch Data */
+    if (info->lines && info->line_count > 0)
     {
         size_t k;
-        double sumPloss = 0.0, sumQloss = 0.0;
-        for (k = 0; k < line_count; ++k)
+        // 重新设置损耗累加器
+        sumPloss = 0.0;
+        sumQloss = 0.0;
+
+        for (k = 0; k < info->line_count; ++k)
         {
-            int fb = lines[k].from_bus - 1;
-            int tb = lines[k].to_bus - 1;
-            double G = lines[k].series_R;   /* 此时已是导纳实部 */
-            double B = -lines[k].series_X;  /* 导纳虚部为 -series_X */
-            double b2 = lines[k].shunt_B;   /* 对端 shunt b/2，标幺 */
+            int fb = info->lines[k].from_bus - 1;
+            int tb = info->lines[k].to_bus - 1;
+            /* 注意：series_R 和 series_X 在 copy_and_convert_lines 中已被转换为导纳的实部和虚部 */
+            double Yseries_G = info->lines[k].series_R;  // 支路串联导纳的实部
+            double Yseries_B = info->lines[k].series_X;  // 支路串联导纳的虚部
+            double b2 = info->lines[k].shunt_B;  // 并联电纳 B/2
 
             double Vi_re = info->e[fb], Vi_im = info->f[fb];
             double Vj_re = info->e[tb], Vj_im = info->f[tb];
 
+            /* 计算支路功率，直接使用支路参数计算（更准确） */
+
+            /* 计算电压差 */
             double dV_re = Vi_re - Vj_re;
             double dV_im = Vi_im - Vj_im;
 
-            /* 从 i 节点到 j 节点的串联电流：(G + jB)*(Vi - Vj) */
-            double Iser_ij_re = G * dV_re - B * dV_im;
-            double Iser_ij_im = G * dV_im + B * dV_re;
-            /* i 节点的并联支路电流：j*b2*Vi */
+            /* 从节点i流入支路的串联电流：Iser_ij = Y_series * (Vi - Vj) */
+            double Iser_ij_re = Yseries_G * dV_re - Yseries_B * dV_im;
+            double Iser_ij_im = Yseries_G * dV_im + Yseries_B * dV_re;
+
+            /* 节点i侧的并联电流：Ishunt_i = j * (b/2) * Vi */
             double Ish_ij_re = -b2 * Vi_im;
             double Ish_ij_im = b2 * Vi_re;
 
+            /* 从节点i流入支路的总电流：Iij = Iser_ij + Ishunt_i */
             double Iij_re = Iser_ij_re + Ish_ij_re;
             double Iij_im = Iser_ij_im + Ish_ij_im;
 
-            /* i 节点总电流 = 串联电流 + 并联电流 */
-            double Sij_re = Vi_re * Iij_re + Vi_im * Iij_im;
-            double Sij_im = Vi_im * Iij_re - Vi_re * Iij_im;
+            /* 从节点i流入支路的功率：Sij = Vi * conj(Iij) */
+            /* 使用更稳定的计算顺序以减少舍入误差 */
+            /* Sij = (Vi_re + j*Vi_im) * (Iij_re - j*Iij_im) */
+            /*     = Vi_re*Iij_re + Vi_im*Iij_im + j*(Vi_im*Iij_re - Vi_re*Iij_im) */
+            /* 优化：先计算乘积项，再求和，减少舍入误差 */
+            double Pij = (Vi_re * Iij_re) + (Vi_im * Iij_im);
+            double Qij = (Vi_im * Iij_re) - (Vi_re * Iij_im);
 
-            /* 从 j 节点到 i 节点的计算 */
-            dV_re = Vj_re - Vi_re;
-            dV_im = Vj_im - Vi_im;
-            double Iser_ji_re = G * dV_re - B * dV_im;
-            double Iser_ji_im = G * dV_im + B * dV_re;
+            /* 从节点j流入支路的串联电流：Iser_ji = Y_series * (Vj - Vi) = -Y_series * (Vi - Vj) */
+            double Iser_ji_re = -Iser_ij_re;
+            double Iser_ji_im = -Iser_ij_im;
+
+            /* 节点j侧的并联电流：Ishunt_j = j * (b/2) * Vj */
             double Ish_ji_re = -b2 * Vj_im;
             double Ish_ji_im = b2 * Vj_re;
+
+            /* 从节点j流入支路的总电流：Iji = Iser_ji + Ishunt_j */
             double Iji_re = Iser_ji_re + Ish_ji_re;
             double Iji_im = Iser_ji_im + Ish_ji_im;
-            double Sji_re = Vj_re * Iji_re + Vj_im * Iji_im;
-            double Sji_im = Vj_im * Iji_re - Vj_re * Iji_im;
 
-            double Ploss = (Sij_re + Sji_re) * baseMVA;
-            double Qloss = (Sij_im + Sji_im) * baseMVA;
+            /* 从节点j流入支路的功率：Sji = Vj * conj(Iji) */
+            /* 使用更稳定的计算顺序以减少舍入误差 */
+            /* Sji = (Vj_re + j*Vj_im) * (Iji_re - j*Iji_im) */
+            /*     = Vj_re*Iji_re + Vj_im*Iji_im + j*(Vj_im*Iji_re - Vj_re*Iji_im) */
+            double Pji = (Vj_re * Iji_re) + (Vj_im * Iji_im);
+            double Qji = (Vj_im * Iji_re) - (Vj_re * Iji_im);
+
+            /* 计算串联损耗 */
+            /* 从 i 到 j 的串联功率 Sser_ij = Vi * conj(Iser_ij) */
+            /* 使用更稳定的计算顺序 */
+            double Pser_ij = (Vi_re * Iser_ij_re) + (Vi_im * Iser_ij_im);
+            double Qser_ij = (Vi_im * Iser_ij_re) - (Vi_re * Iser_ij_im);
+            /* 从 j 到 i 的串联功率 Sser_ji = Vj * conj(Iser_ji) */
+            double Pser_ji = (Vj_re * Iser_ji_re) + (Vj_im * Iser_ji_im);
+            double Qser_ji = (Vj_im * Iser_ji_re) - (Vj_re * Iser_ji_im);
+
+            /* 计算最终打印的 Loss */
+            double Ploss = (Pser_ij + Pser_ji) * baseMVA;
+            double Qloss = (Qser_ij + Qser_ji) * baseMVA;
 
             sumPloss += Ploss;
             sumQloss += Qloss;
 
             printf("%% %5zu  %5d  %5d  %8.2f  %8.2f  %8.2f  %8.2f  %8.3f  %8.3f\n",
                 k + 1,
-                lines[k].from_bus,
-                lines[k].to_bus,
-                Sij_re * baseMVA,
-                Sij_im * baseMVA,
-                Sji_re * baseMVA,
-                Sji_im * baseMVA,
-                Ploss,
-                Qloss);
+                info->lines[k].from_bus,
+                info->lines[k].to_bus,
+                Pij * baseMVA, // Total Injection
+                Qij * baseMVA, // Total Injection
+                Pji * baseMVA, // Total Injection
+                Qji * baseMVA, // Total Injection
+                Ploss,         // Series Loss
+                Qloss);        // Series Loss
         }
 
-        /* Branch 部分 Total 行 */
         printf("%%                                                              --------  --------\n");
         printf("%%                                                     Total:  %8.3f  %8.3f\n",
             sumPloss,
@@ -1281,10 +1691,11 @@ int main(void)
         return 1;
     }
 
-    start_iteration(&iter, 1e-4, 1000, &converged, &iterations, &runtime);
+    /* 提高收敛精度以减少数值误差，MATPOWER默认使用1e-8 */
+    start_iteration(&iter, 1e-8, 1000, &converged, &iterations, &runtime);
 
     /* 按课程给的 printpf 样式输出结果（输出到控制台） */
-    print_report(&info, line_args, line_count, converged, runtime);
+    print_report(&info, converged, runtime, baseMVA);
 
     free_iteration(&iter);
     free_network(&info);

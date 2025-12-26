@@ -1,4 +1,4 @@
-// #include <stdbool.h> 减少调用标准库，converged用int代替bool
+// #include <stdbool.h> 减少调用标准库，用int代替bool
 #include <windows.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +22,6 @@ typedef struct
     int to_bus;   // 终止节点
     double series_R; // 电阻
     double series_X; // 电抗
-    double shunt_G; // 并联电导
     double shunt_B; // 并联电纳
 } LineArg; // 线路参数
 
@@ -63,11 +62,22 @@ typedef struct
     int order;      /* 节点总数 */
 
     double* G;      /* 节点导纳矩阵实部 */
-    double* B;      /* 节点导纳矩阵虚部（电纳） */
+    double* B;      /* 节点导纳矩阵虚部 */
 
     double* e;      /* 节点电压实部 */
     double* f;      /* 节点电压虚部 */
 } NetworkInfo; // 网络信息
+
+/* 稀疏矩阵结构（CSR格式：Compressed Sparse Row） */
+typedef struct
+{
+    int nrows;          /* 矩阵行数 */
+    int ncols;          /* 矩阵列数 */
+    int nnz;            /* 非零元素个数 */
+    int* row_ptr;       /* 行指针数组，长度为 nrows+1 */
+    int* col_idx;       /* 列索引数组，长度为 nnz */
+    double* values;     /* 非零元素值数组，长度为 nnz */
+} SparseMatrix;
 
 typedef struct
 {
@@ -82,7 +92,7 @@ typedef struct
 
     int* var_indices;   /* 非平衡节点在网络中的索引顺序：先 PQ 再 PV */
     double* delta;      /* 常数项向量 */
-    double* J;          /* 雅可比矩阵 */
+    SparseMatrix J_sparse; /* 稀疏雅可比矩阵 */
 
     double tolerance; /* 收敛容差 */
     int max_iter;    /* 最大迭代次数 */
@@ -101,6 +111,151 @@ static void ensure_alloc(void* ptr, const char* label)
         fprintf(stderr, "%s allocation failed\n", label); /* 分配失败 */
         exit(EXIT_FAILURE);
     }
+}
+
+/*====================== 稀疏矩阵操作 ======================*/
+/// <summary>
+/// 初始化稀疏矩阵
+/// </summary>
+static void sparse_matrix_init(SparseMatrix* mat, int nrows, int ncols)
+{
+    if (!mat) return;
+    memset(mat, 0, sizeof(*mat));
+    mat->nrows = nrows;
+    mat->ncols = ncols;
+    mat->nnz = 0;
+    mat->row_ptr = (int*)calloc((size_t)(nrows + 1), sizeof(int));
+    ensure_alloc(mat->row_ptr, "sparse row_ptr");
+}
+
+/// <summary>
+/// 释放稀疏矩阵
+/// </summary>
+static void sparse_matrix_free(SparseMatrix* mat)
+{
+    if (!mat) return;
+    if (mat->row_ptr) free(mat->row_ptr);
+    if (mat->col_idx) free(mat->col_idx);
+    if (mat->values) free(mat->values);
+    memset(mat, 0, sizeof(*mat));
+}
+
+/// <summary>
+/// 从三元组格式构建CSR稀疏矩阵（先收集所有非零元素，再转换为CSR）
+/// </summary>
+/// <param name="mat">输出稀疏矩阵</param>
+/// <param name="triplets">三元组数组，每个元素为 (row, col, value)</param>
+/// <param name="nnz">非零元素个数</param>
+static void sparse_matrix_from_triplets(SparseMatrix* mat, 
+    const int* row_idx, const int* col_idx, const double* values, int nnz)
+{
+    int i, j;
+    int* row_counts = NULL;
+
+    if (!mat || !row_idx || !col_idx || !values || nnz <= 0) return;
+
+    /* 统计每行的非零元素个数 */
+    row_counts = (int*)calloc((size_t)mat->nrows, sizeof(int));
+    ensure_alloc(row_counts, "row_counts");
+    
+    for (i = 0; i < nnz; ++i)
+    {
+        if (row_idx[i] >= 0 && row_idx[i] < mat->nrows &&
+            col_idx[i] >= 0 && col_idx[i] < mat->ncols)
+        {
+            row_counts[row_idx[i]]++;
+        }
+    }
+
+    /* 构建row_ptr */
+    mat->row_ptr[0] = 0;
+    for (i = 0; i < mat->nrows; ++i)
+    {
+        mat->row_ptr[i + 1] = mat->row_ptr[i] + row_counts[i];
+    }
+    mat->nnz = mat->row_ptr[mat->nrows];
+
+    /* 分配col_idx和values */
+    mat->col_idx = (int*)calloc((size_t)mat->nnz, sizeof(int));
+    mat->values = (double*)calloc((size_t)mat->nnz, sizeof(double));
+    ensure_alloc(mat->col_idx, "sparse col_idx");
+    ensure_alloc(mat->values, "sparse values");
+
+    /* 重置row_counts作为每行的当前位置计数器 */
+    memset(row_counts, 0, (size_t)mat->nrows * sizeof(int));
+
+    /* 填充col_idx和values */
+    for (i = 0; i < nnz; ++i)
+    {
+        int r = row_idx[i];
+        int c = col_idx[i];
+        if (r >= 0 && r < mat->nrows && c >= 0 && c < mat->ncols)
+        {
+            int pos = mat->row_ptr[r] + row_counts[r];
+            mat->col_idx[pos] = c;
+            mat->values[pos] = values[i];
+            row_counts[r]++;
+        }
+    }
+
+    /* 对每行的列索引进行排序（可选，但有助于数值稳定性） */
+    if (mat->col_idx && mat->values && mat->nnz > 0)
+    {
+        /* 保存nnz值到局部变量，帮助静态分析工具理解边界 */
+        const int nnz = mat->nnz;
+        for (i = 0; i < mat->nrows; ++i)
+        {
+            int start = mat->row_ptr[i];
+            int end = mat->row_ptr[i + 1];
+            /* 严格的边界保护，防止静态分析认为可能越界 */
+            if (start < 0 || start >= nnz)
+                continue; /* 跳过无效起始位置 */
+            if (end < start || end > nnz)
+                continue; /* 跳过无效结束位置 */
+            if (start >= end)
+                continue; /* 跳过空行 */
+
+            /* 简单的冒泡排序（每行元素通常很少） */
+            /* 此时 start 在 [0, nnz) 范围内，end 在 (start, nnz] 范围内 */
+            /* 在循环条件中明确限制 j 和 k 的范围，确保不超过 nnz */
+            for (j = start; j < end - 1 && j < nnz - 1; ++j)
+            {
+                int k;
+                /* 在循环条件中明确限制 k 的范围，确保不超过 nnz */
+                for (k = j + 1; k < end && k < nnz; ++k)
+                {
+                    /* 此时 j 和 k 都在 [0, nnz) 范围内，可以安全访问数组 */
+                    if (mat->col_idx[j] > mat->col_idx[k])
+                    {
+                        int tmp_col = mat->col_idx[j];
+                        double tmp_val = mat->values[j];
+                        mat->col_idx[j] = mat->col_idx[k];
+                        mat->values[j] = mat->values[k];
+                        mat->col_idx[k] = tmp_col;
+                        mat->values[k] = tmp_val;
+                    }
+                }
+            }
+        }
+    }
+    if (row_counts) free(row_counts);
+}
+
+/// <summary>
+/// 获取稀疏矩阵指定位置的元素值
+/// </summary>
+static double sparse_matrix_get(const SparseMatrix* mat, int row, int col)
+{
+    int i;
+    if (!mat || row < 0 || row >= mat->nrows || col < 0 || col >= mat->ncols)
+        return 0.0;
+    
+    for (i = mat->row_ptr[row]; i < mat->row_ptr[row + 1]; ++i)
+    {
+        if (mat->col_idx[i] == col)
+            return mat->values[i];
+    }
+    return 0.0;
 }
 
 /// <summary>
@@ -220,7 +375,7 @@ static int read_case_m(const char* filename,
         }
     }
 
-    // 读取 branch 数据 (计数)
+    // 读取 branch 数据
     size_t line_count = 0;
     while (fgets(buf, sizeof(buf), fp))
     {
@@ -315,7 +470,6 @@ static int read_case_m(const char* filename,
                 double Qmax = 0.0, Qmin = 0.0, Vg = 0.0;
                 double mBase = 0.0;
                 int status = 0;
-                /* 读取更多字段以获取Vg（第6个字段） */
                 if (sscanf_s(buf, "%d %lf %lf %lf %lf %lf %lf %d",
                     &gen_bus, &Pg, &Qg, &Qmax, &Qmin, &Vg, &mBase, &status) >= 3)
                 {
@@ -355,7 +509,6 @@ static int read_case_m(const char* filename,
                         (*out_lines)[idx].to_bus = tbus;
                         (*out_lines)[idx].series_R = r;
                         (*out_lines)[idx].series_X = x;
-                        (*out_lines)[idx].shunt_G = 0.0; // 假设并联电导为 0
                         (*out_lines)[idx].shunt_B = b_half; // 存储线路充电电纳 B/2
                         idx++;
                     }
@@ -648,7 +801,7 @@ static void init_network(NetworkInfo* info,
     copy_and_convert_lines(info, lines, line_count);
     info->order = discover_order(nodes, node_count);
     reorder_nodes(info, nodes, node_count);
-    reorder_init_values(info, init_vals, node_count); // 修正 count 参数为 node_count
+    reorder_init_values(info, init_vals, node_count);
     allocate_state(info);
     allocate_admittance(info);
     fill_admittance(info);
@@ -757,10 +910,11 @@ static int init_iteration(NLIteration* ctx, NetworkInfo* info)
     build_index_sets(ctx);
 
     ctx->delta = (double*)calloc((size_t)ctx->eq_count, sizeof(double));
-    ctx->J = (double*)calloc((size_t)ctx->eq_count * (size_t)ctx->eq_count,
-        sizeof(double));
     ensure_alloc(ctx->delta, "delta");
-    ensure_alloc(ctx->J, "Jacobian");
+    
+    /* 初始化稀疏矩阵 */
+    sparse_matrix_init(&ctx->J_sparse, ctx->eq_count, ctx->eq_count);
+    
     return 0;
 }
 
@@ -774,7 +928,7 @@ static void free_iteration(NLIteration* ctx)
 
     if (ctx->var_indices) free(ctx->var_indices);
     if (ctx->delta)       free(ctx->delta);
-    if (ctx->J)           free(ctx->J);
+    sparse_matrix_free(&ctx->J_sparse);
     memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -934,106 +1088,6 @@ static void calc_delta(NLIteration* ctx)
 }
 
 /// <summary>
-/// 填充行对
-/// </summary>
-/// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <param name="row_idx">行索引（非平衡节点在 var_indices 中的索引）</param>
-/// <param name="row1">第一行（ΔP 行）</param>
-/// <param name="row2">第二行（ΔQ 或 Δ|U|^2 行）</param>
-static void fill_row_pair(NLIteration* ctx, int row_idx, double* row1, double* row2)
-{
-    int i = ctx->var_indices[row_idx]; // 当前节点在网络中的索引
-    const NetworkInfo* info = ctx->info;
-    double e_i = info->e[i];
-    double f_i = info->f[i];
-    int col;
-
-    for (col = 0; col < ctx->non_slack; ++col)
-    {
-        int j = ctx->var_indices[col]; // 变量 $e_j, f_j$ 对应的节点在网络中的索引
-        double Gij = mat_get(info->G, info->order, i, j);
-        double Bij = mat_get(info->B, info->order, i, j);
-        double dP_dfj, dP_dej, dQ_dfj, dQ_dej;
-
-        if (i == j)
-        {
-            /* 对角元素 i=j: H_ii, N_ii, J_ii/L_ii */
-            double A_i = 0.0, B_i = 0.0; // A_i = sum_k(Gik*fk + Bik*ek), B_i = sum_k(Gik*ek - Bik*fk)
-            int k;
-
-            /* 计算 A_i 和 B_i */
-            for (k = 0; k < info->order; ++k)
-            {
-                double e_k = info->e[k];
-                double f_k = info->f[k];
-                double Gik = mat_get(info->G, info->order, i, k);
-                double Bik = mat_get(info->B, info->order, i, k);
-
-                // B_i 对应实部 Gik*ek - Bik*fk
-                B_i += Gik * e_k - Bik * f_k;
-                // A_i 对应虚部 Gik*fk + Bik*ek
-                A_i += Gik * f_k + Bik * e_k;
-            }
-
-            /* Gij 和 Bij 此时为 Gii 和 Bii */
-
-            /* H_ii = ∂P/∂f_i = A_i + f_i * Gii - e_i * Bii */
-            dP_dfj = A_i + f_i * Gij - e_i * Bij;
-
-            /* N_ii = ∂P/∂e_i = B_i + e_i * Gii + f_i * Bii */
-            dP_dej = B_i + e_i * Gij + f_i * Bij;
-
-            if (info->nodes[i].type == NODE_PV)
-            {
-                /* PV 节点：第二行是 Δ(|U|^2) = |U|^2 - V_set^2 */
-                /* ∂(|U|^2)/∂f_i */
-                dQ_dfj = 2.0 * f_i;
-                /* ∂(|U|^2)/∂e_i */
-                dQ_dej = 2.0 * e_i;
-            }
-            else
-            {
-                /* PQ 节点：第二行是 ΔQ */
-                /* J_ii = ∂Q/∂f_i = B_i - f_i * Bii - e_i * Gii */
-                dQ_dfj = B_i - f_i * Bij - e_i * Gij;
-                /* L_ii = ∂Q/∂e_i = -A_i - e_i * Bii + f_i * Gii */
-                dQ_dej = -A_i - e_i * Bij + f_i * Gij;
-            }
-        }
-        else
-        {
-            /* 非对角元素 i!=j: H_ij, N_ij, J_ij/L_ij */
-
-            /* H_ij = ∂P_i/∂f_j = -e_i * B_ij + f_i * G_ij */
-            dP_dfj = -e_i * Bij + f_i * Gij;
-
-            /* N_ij = ∂P_i/∂e_j = e_i * G_ij + f_i * B_ij */
-            dP_dej = e_i * Gij + f_i * Bij;
-
-            if (info->nodes[i].type == NODE_PV)
-            {
-                /* PV 节点：第二行是 Δ(|U|^2)。|U|_i^2 不依赖于 f_j, e_j (j != i) */
-                dQ_dfj = 0.0;
-                dQ_dej = 0.0;
-            }
-            else
-            {
-                /* PQ 节点：第二行是 ΔQ */
-                /* J_ij = ∂Q_i/∂f_j = -e_i * G_ij - f_i * B_ij */
-                dQ_dfj = -e_i * Gij - f_i * Bij;
-                /* L_ij = ∂Q_i/∂e_j = -e_i * B_ij + f_i * G_ij */
-                dQ_dej = -e_i * Bij + f_i * Gij;
-            }
-        }
-
-        row1[col * 2] = dP_dfj;  // 对 f_j 的导数 (H/J 块)
-        row1[col * 2 + 1] = dP_dej; // 对 e_j 的导数 (N/L 块)
-        row2[col * 2] = dQ_dfj;  // 对 f_j 的导数 (J/dQ_df 或 ∂|U|^2/∂f)
-        row2[col * 2 + 1] = dQ_dej; // 对 e_j 的导数 (L/dQ_de 或 ∂|U|^2/∂e)
-    }
-}
-
-/// <summary>
 /// 预先计算所有节点的A_i和B_i（用于雅可比矩阵对角元素）
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
@@ -1069,204 +1123,296 @@ static void precompute_AB(NLIteration* ctx, double* A, double* B)
 }
 
 /// <summary>
-/// 填充行对
+/// 生成稀疏雅可比矩阵
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
-/// <param name="row_idx">行索引（非平衡节点在 var_indices 中的索引）</param>
-/// <param name="row1">第一行（ΔP 行）</param>
-/// <param name="row2">第二行（ΔQ 或 Δ|U|^2 行）</param>
-/// <param name="A">预计算的A数组</param>
-/// <param name="B">预计算的B数组</param>
-static void fill_row_pair_optimized(NLIteration* ctx, int row_idx, double* row1, double* row2,
-    const double* A, const double* B)
+static void gen_sparse_jacobian(NLIteration* ctx)
 {
-    int i = ctx->var_indices[row_idx]; // 当前节点在网络中的索引
-    const NetworkInfo* info = ctx->info;
-    double e_i = info->e[i];
-    double f_i = info->f[i];
-    int col;
+    int row, col;
+    int* row_idx = NULL;
+    int* col_idx = NULL;
+    double* values = NULL;
+    int nnz_count = 0;
+    int max_nnz_estimate;
 
-    for (col = 0; col < ctx->non_slack; ++col)
+    if (!ctx) return;
+
+    /* 估算最大非零元素个数：每个节点最多与所有其他节点相连 */
+    /* 对于雅可比矩阵，每个节点对最多有4个非零元素（2x2块） */
+    max_nnz_estimate = ctx->eq_count * ctx->eq_count / 4; /* 保守估计 */
+    if (max_nnz_estimate < ctx->eq_count * 10) /* 至少每行10个非零元素 */
+        max_nnz_estimate = ctx->eq_count * 10;
+
+    row_idx = (int*)calloc((size_t)max_nnz_estimate, sizeof(int));
+    col_idx = (int*)calloc((size_t)max_nnz_estimate, sizeof(int));
+    values = (double*)calloc((size_t)max_nnz_estimate, sizeof(double));
+    ensure_alloc(row_idx, "sparse row_idx");
+    ensure_alloc(col_idx, "sparse col_idx");
+    ensure_alloc(values, "sparse values");
+
+    /* 预先计算所有节点的A_i和B_i */
+    double* A = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+    double* B = (double*)calloc((size_t)ctx->info->order, sizeof(double));
+    if (!A || !B)
     {
-        int j = ctx->var_indices[col]; // 变量 $e_j, f_j$ 对应的节点在网络中的索引
-        double Gij = mat_get(info->G, info->order, i, j);
-        double Bij = mat_get(info->B, info->order, i, j);
-        double dP_dfj, dP_dej, dQ_dfj, dQ_dej;
-
-        if (i == j)
-        {
-            /* 对角元素 i=j: H_ii, N_ii, J_ii/L_ii */
-            /* 使用预计算的 A_i 和 B_i */
-            double A_i = A[i];
-            double B_i = B[i];
-
-            /* H_ii = ∂P/∂f_i = A_i + f_i * Gii - e_i * Bii */
-            dP_dfj = A_i + f_i * Gij - e_i * Bij;
-
-            /* N_ii = ∂P/∂e_i = B_i + e_i * Gii + f_i * Bii */
-            dP_dej = B_i + e_i * Gij + f_i * Bij;
-
-            if (info->nodes[i].type == NODE_PV)
-            {
-                /* PV 节点：第二行是 Δ(|U|^2) = |U|^2 - V_set^2 */
-                /* ∂(|U|^2)/∂f_i */
-                dQ_dfj = 2.0 * f_i;
-                /* ∂(|U|^2)/∂e_i */
-                dQ_dej = 2.0 * e_i;
-            }
-            else
-            {
-                /* PQ 节点：第二行是 ΔQ */
-                /* J_ii = ∂Q/∂f_i = B_i - f_i * Bii - e_i * Gii */
-                dQ_dfj = B_i - f_i * Bij - e_i * Gij;
-                /* L_ii = ∂Q/∂e_i = -A_i - e_i * Bii + f_i * Gii */
-                dQ_dej = -A_i - e_i * Bij + f_i * Gij;
-            }
-        }
-        else
-        {
-            /* 非对角元素 i!=j: H_ij, N_ij, J_ij/L_ij */
-
-            /* H_ij = ∂P_i/∂f_j = -e_i * B_ij + f_i * G_ij */
-            dP_dfj = -e_i * Bij + f_i * Gij;
-
-            /* N_ij = ∂P_i/∂e_j = e_i * G_ij + f_i * B_ij */
-            dP_dej = e_i * Gij + f_i * Bij;
-
-            if (info->nodes[i].type == NODE_PV)
-            {
-                /* PV 节点：第二行是 Δ(|U|^2)。|U|_i^2 不依赖于 f_j, e_j (j != i) */
-                dQ_dfj = 0.0;
-                dQ_dej = 0.0;
-            }
-            else
-            {
-                /* PQ 节点：第二行是 ΔQ */
-                /* J_ij = ∂Q_i/∂f_j = -e_i * G_ij - f_i * B_ij */
-                dQ_dfj = -e_i * Gij - f_i * Bij;
-                /* L_ij = ∂Q_i/∂e_j = -e_i * B_ij + f_i * G_ij */
-                dQ_dej = -e_i * Bij + f_i * Gij;
-            }
-        }
-
-        row1[col * 2] = dP_dfj;  // 对 f_j 的导数 (H/J 块)
-        row1[col * 2 + 1] = dP_dej; // 对 e_j 的导数 (N/L 块)
-        row2[col * 2] = dQ_dfj;  // 对 f_j 的导数 (J/dQ_df 或 ∂|U|^2/∂f)
-        row2[col * 2 + 1] = dQ_dej; // 对 e_j 的导数 (L/dQ_de 或 ∂|U|^2/∂e)
+        free(row_idx);
+        free(col_idx);
+        free(values);
+        return;
     }
+    precompute_AB(ctx, A, B);
+
+    /* 收集所有非零元素 */
+    for (row = 0; row < ctx->non_slack; ++row)
+    {
+        int i = ctx->var_indices[row]; /* 当前节点在网络中的索引 */
+        const NetworkInfo* info = ctx->info;
+        double e_i = info->e[i];
+        double f_i = info->f[i];
+        int eq_row1 = 2 * row;     /* ΔP 行 */
+        int eq_row2 = 2 * row + 1;  /* ΔQ 或 Δ|U|^2 行 */
+
+        for (col = 0; col < ctx->non_slack; ++col)
+        {
+            int j = ctx->var_indices[col]; /* 变量对应的节点索引 */
+            double Gij = mat_get(info->G, info->order, i, j);
+            double Bij = mat_get(info->B, info->order, i, j);
+            double dP_dfj, dP_dej, dQ_dfj, dQ_dej;
+
+            if (i == j)
+            {
+                /* 对角元素 */
+                double A_i = A[i];
+                double B_i = B[i];
+
+                dP_dfj = A_i + f_i * Gij - e_i * Bij;
+                dP_dej = B_i + e_i * Gij + f_i * Bij;
+
+                if (info->nodes[i].type == NODE_PV)
+                {
+                    dQ_dfj = 2.0 * f_i;
+                    dQ_dej = 2.0 * e_i;
+                }
+                else
+                {
+                    dQ_dfj = B_i - f_i * Bij - e_i * Gij;
+                    dQ_dej = -A_i - e_i * Bij + f_i * Gij;
+                }
+            }
+            else
+            {
+                /* 非对角元素 */
+                dP_dfj = -e_i * Bij + f_i * Gij;
+                dP_dej = e_i * Gij + f_i * Bij;
+
+                if (info->nodes[i].type == NODE_PV)
+                {
+                    dQ_dfj = 0.0;
+                    dQ_dej = 0.0;
+                }
+                else
+                {
+                    dQ_dfj = -e_i * Gij - f_i * Bij;
+                    dQ_dej = -e_i * Bij + f_i * Gij;
+                }
+            }
+
+            int eq_col1 = 2 * col;     /* f_j 列 */
+            int eq_col2 = 2 * col + 1;  /* e_j 列 */
+
+            /* 只存储非零元素 */
+            if (fabs(dP_dfj) > 1e-15)
+            {
+                if (nnz_count >= max_nnz_estimate) break;
+                row_idx[nnz_count] = eq_row1;
+                col_idx[nnz_count] = eq_col1;
+                values[nnz_count] = dP_dfj;
+                nnz_count++;
+            }
+            if (fabs(dP_dej) > 1e-15)
+            {
+                if (nnz_count >= max_nnz_estimate) break;
+                row_idx[nnz_count] = eq_row1;
+                col_idx[nnz_count] = eq_col2;
+                values[nnz_count] = dP_dej;
+                nnz_count++;
+            }
+            if (fabs(dQ_dfj) > 1e-15)
+            {
+                if (nnz_count >= max_nnz_estimate) break;
+                row_idx[nnz_count] = eq_row2;
+                col_idx[nnz_count] = eq_col1;
+                values[nnz_count] = dQ_dfj;
+                nnz_count++;
+            }
+            if (fabs(dQ_dej) > 1e-15)
+            {
+                if (nnz_count >= max_nnz_estimate) break;
+                row_idx[nnz_count] = eq_row2;
+                col_idx[nnz_count] = eq_col2;
+                values[nnz_count] = dQ_dej;
+                nnz_count++;
+            }
+        }
+    }
+
+    free(A);
+    free(B);
+
+    /* 释放旧的稀疏矩阵 */
+    sparse_matrix_free(&ctx->J_sparse);
+
+    /* 构建新的稀疏矩阵 */
+    sparse_matrix_init(&ctx->J_sparse, ctx->eq_count, ctx->eq_count);
+    sparse_matrix_from_triplets(&ctx->J_sparse, row_idx, col_idx, values, nnz_count);
+
+    free(row_idx);
+    free(col_idx);
+    free(values);
 }
 
 /// <summary>
-/// 生成雅可比矩阵
+/// 生成雅可比矩阵（保留密集版本作为备用）
 /// </summary>
 /// <param name="ctx">牛顿-拉夫逊迭代上下文</param>
 static void gen_jacobian(NLIteration* ctx)
 {
-    int row;
-
-    if (!ctx || !ctx->J) return;
-    memset(ctx->J, 0, (size_t)ctx->eq_count * (size_t)ctx->eq_count
-        * sizeof(double));
-
-    /* 预先计算所有节点的A_i和B_i，避免重复计算 */
-    double* A = (double*)calloc((size_t)ctx->info->order, sizeof(double));
-    double* B = (double*)calloc((size_t)ctx->info->order, sizeof(double));
-    if (A && B)
-    {
-        precompute_AB(ctx, A, B);
-        for (row = 0; row < ctx->non_slack; ++row)
-        {
-            double* row1 = ctx->J + (size_t)(2 * row) * (size_t)ctx->eq_count;
-            double* row2 = ctx->J + (size_t)(2 * row + 1) * (size_t)ctx->eq_count;
-            fill_row_pair_optimized(ctx, row, row1, row2, A, B);
-        }
-        free(A);
-        free(B);
-    }
-    else
-    {
-        /* 如果内存分配失败，回退到原始方法 */
-        for (row = 0; row < ctx->non_slack; ++row)
-        {
-            double* row1 = ctx->J + (size_t)(2 * row) * (size_t)ctx->eq_count;
-            double* row2 = ctx->J + (size_t)(2 * row + 1) * (size_t)ctx->eq_count;
-            fill_row_pair(ctx, row, row1, row2);
-        }
-    }
+    /* 使用稀疏版本 */
+    gen_sparse_jacobian(ctx);
 }
 
 /// <summary>
-/// 求解线性系统
+/// 稀疏LU分解求解器（使用部分主元选择）
 /// </summary>
-/// <param name="A">系数矩阵</param>
+/// <param name="A">稀疏系数矩阵</param>
 /// <param name="b">常数项向量</param>
 /// <param name="x">解向量</param>
-/// <param name="n">方程个数</param>
-static void solve_linear_system(const double* A, const double* b, double* x, int n)
+static void solve_sparse_linear_system(const SparseMatrix* A, const double* b, double* x)
 {
-    int i, j, col;
+    int i, j, k, n;
+    int* perm = NULL;  /* 行置换数组 */
+    double* y = NULL;
 
-    if (!A || !b || !x || n <= 0) return;
-    double* aug = (double*)calloc((size_t)n * (size_t)(n + 1), sizeof(double));
-    ensure_alloc(aug, "augmented matrix");
-    if (!aug) return;
+    if (!A || !b || !x) return;
+    n = A->nrows;
+    
+    /* 分配密集矩阵用于LU分解（初始化为 0） */
+    double* dense = (double*)calloc((size_t)n * (size_t)n, sizeof(double));
+    ensure_alloc(dense, "dense matrix for LU");
+    if (!dense) return;
 
+    /* 
+     * 将稀疏矩阵高效转换为密集格式：
+     * 只遍历非零元，复杂度 O(nnz)，避免反复调用 sparse_matrix_get 的额外开销
+     */
     for (i = 0; i < n; ++i)
     {
-        for (j = 0; j < n; ++j)
-            aug[i * (n + 1) + j] = A[i * n + j];
-        aug[i * (n + 1) + n] = b[i];
+        int row_start = A->row_ptr[i];
+        int row_end   = A->row_ptr[i + 1];
+        for (j = row_start; j < row_end; ++j)
+        {
+            int col = A->col_idx[j];
+            if (col >= 0 && col < n)
+            {
+                dense[i * n + col] = A->values[j];
+            }
+        }
     }
 
-    for (col = 0; col < n; ++col)
-    {
-        int pivot = col;
-        double max_val = fabs(aug[col * (n + 1) + col]);
-        int row;
+    /* 分配行置换数组 */
+    perm = (int*)calloc((size_t)n, sizeof(int));
+    ensure_alloc(perm, "permutation");
+    if (!perm) { free(dense); return; }
+    for (i = 0; i < n; ++i) perm[i] = i;
 
-        for (row = col + 1; row < n; ++row)
+    /* 执行LU分解（带部分主元选择） */
+    for (k = 0; k < n - 1; ++k)
+    {
+        /* 寻找主元 */
+        int pivot = k;
+        double max_val = fabs(dense[k * n + k]);
+        for (i = k + 1; i < n; ++i)
         {
-            double val = fabs(aug[row * (n + 1) + col]);
+            double val = fabs(dense[i * n + k]);
             if (val > max_val)
             {
                 max_val = val;
-                pivot = row;
+                pivot = i;
             }
         }
+
         if (fabs(max_val) < 1e-12)
         {
-            fprintf(stderr, "Jacobian matrix is singular\n");
-            free(aug);
+            fprintf(stderr, "Jacobian matrix is singular at column %d\n", k);
+            free(dense);
+            free(perm);
             exit(EXIT_FAILURE);
         }
 
-        if (pivot != col)
+        /* 交换行 */
+        if (pivot != k)
         {
-            int k;
-            for (k = col; k <= n; ++k)
+            int tmp_perm = perm[k];
+            perm[k] = perm[pivot];
+            perm[pivot] = tmp_perm;
+            for (j = 0; j < n; ++j)
             {
-                double tmp = aug[col * (n + 1) + k];
-                aug[col * (n + 1) + k] = aug[pivot * (n + 1) + k];
-                aug[pivot * (n + 1) + k] = tmp;
+                double tmp = dense[k * n + j];
+                dense[k * n + j] = dense[pivot * n + j];
+                dense[pivot * n + j] = tmp;
             }
         }
 
-        double pivot_val = aug[col * (n + 1) + col];
-        int k;
-        for (k = col; k <= n; ++k)
-            aug[col * (n + 1) + k] /= pivot_val;
-        for (row = 0; row < n; ++row)
+        /* 消元 */
+        double pivot_val = dense[k * n + k];
+        for (i = k + 1; i < n; ++i)
         {
-            if (row == col) continue;
-            double factor = aug[row * (n + 1) + col];
-            for (k = col; k <= n; ++k)
-                aug[row * (n + 1) + k] -= factor * aug[col * (n + 1) + k];
+            double factor = dense[i * n + k] / pivot_val;
+            dense[i * n + k] = factor; /* 存储L矩阵的元素 */
+            for (j = k + 1; j < n; ++j)
+            {
+                dense[i * n + j] -= factor * dense[k * n + j];
+            }
         }
     }
 
+    /* 前向替换：Ly = Pb */
+    y = (double*)calloc((size_t)n, sizeof(double));
+    ensure_alloc(y, "y vector");
+    if (!y) { free(dense); free(perm); return; }
+
     for (i = 0; i < n; ++i)
-        x[i] = aug[i * (n + 1) + n];
-    if (aug) free(aug);
+    {
+        double sum = b[perm[i]];
+        for (j = 0; j < i; ++j)
+        {
+            sum -= dense[i * n + j] * y[j];
+        }
+        y[i] = sum;
+    }
+
+    /* 后向替换：Ux = y */
+    for (i = n - 1; i >= 0; --i)
+    {
+        double sum = y[i];
+        for (j = i + 1; j < n; ++j)
+        {
+            sum -= dense[i * n + j] * x[j];
+        }
+        if (fabs(dense[i * n + i]) < 1e-12)
+        {
+            fprintf(stderr, "U matrix is singular at row %d\n", i);
+            free(dense);
+            free(perm);
+            free(y);
+            exit(EXIT_FAILURE);
+        }
+        x[i] = sum / dense[i * n + i];
+    }
+
+    free(dense);
+    free(perm);
+    free(y);
 }
 
 /// <summary>
@@ -1353,7 +1499,7 @@ static void start_iteration(NLIteration* ctx,
     {
         int i;
         gen_jacobian(ctx);
-        solve_linear_system(ctx->J, ctx->delta, correction, ctx->eq_count);
+        solve_sparse_linear_system(&ctx->J_sparse, ctx->delta, correction);
         apply_correction(ctx, correction);
         
         /* 计算更新后的功率不匹配 */
